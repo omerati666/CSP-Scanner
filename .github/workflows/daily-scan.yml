@@ -1,0 +1,74 @@
+name: Daily CSP Scan
+
+on:
+  schedule:
+    # Hafta içi her gün 19:00 UTC = Türkiye saati 22:00 (ABD piyasası kapanışına ~2 saat var)
+    # ABD yaz saatinde (Mart-Kasım) bu saat piyasa kapanışına ~1 saat kala olur.
+    # Saati değiştirmek için ilk sayı = dakika, ikinci sayı = UTC saat.
+    - cron: "0 19 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Test için sadece bu hisseleri tara (ör. AAPL,MSFT). Boş bırakırsan tüm liste taranır."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: csp-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Kodu indir
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Paketleri kur
+        run: pip install -r requirements.txt
+
+      - name: Testleri çalıştır
+        run: python -m unittest discover -s tests -v
+
+      - name: Taramayı çalıştır ve mail at
+        env:
+          MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          SYMBOLS_OVERRIDE: ${{ inputs.symbols }}
+        run: python scanner.py
+
+      - name: Raporu sakla
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csp-report
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: IV geçmişini kaydet
+        if: success()
+        run: |
+          git config user.name "csp-scanner-bot"
+          git config user.email "csp-scanner-bot@users.noreply.github.com"
+          git add data/iv_history.csv
+          if git diff --cached --quiet; then
+            echo "IV geçmişinde değişiklik yok."
+          else
+            git commit -m "IV geçmişi güncellendi"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push
+          fi
