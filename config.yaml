@@ -22,7 +22,7 @@ universe:
   - KLAC
   - ADI
   - NXPI
-  - ON
+  - "ON"
   - MRVL
   - ARM
   - CRWD
