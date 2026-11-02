@@ -38,6 +38,13 @@ UNDERLYING_LABELS = {
     "daily_change": "Günlük değişim sınır dışında",
 }
 
+# Hisse filtresi kodu -> "yakın kaçan" kodu
+UNDERLYING_NEAR_CODE = {
+    "price_range": "underlying_price_range",
+    "underlying_volume": "underlying_volume",
+    "daily_change": "underlying_daily_change",
+}
+
 FUNNEL_LABELS = [
     ("contracts_total", "Taranan put kontratı (hisse filtrelerini geçen hisselerde)"),
     ("rej_missing", "Eksik / geçersiz veri"),
@@ -53,6 +60,24 @@ FUNNEL_LABELS = [
     ("rej_iv", "IV rank / percentile yetersiz"),
     ("passed", "TÜM FİLTRELERİ GEÇEN"),
 ]
+
+# Yakın kaçan gruplarının başlıkları (gösterim sırası bu listedir)
+NEAR_LABELS = [
+    ("earnings", "Sadece earnings kuralına takılanlar (vade earnings tarihinden önce değil)"),
+    ("earnings_unknown", "Sadece earnings tarihi bulunamadığı için elenenler"),
+    ("iv", "Sadece IV rank / percentile'a takılanlar"),
+    ("oi", "Sadece open interest düşük olanlar"),
+    ("volume", "Sadece opsiyon hacmi düşük olanlar"),
+    ("bid", "Sadece bid yetersiz olanlar"),
+    ("spread", "Sadece bid-ask spread geniş olanlar"),
+    ("return", "Sadece yıllık getirisi düşük olanlar"),
+    ("delta", "Sadece delta bandının hemen dışında kalanlar"),
+    ("underlying_price_range", "Sadece hisse fiyat aralığı yüzünden elenenler"),
+    ("underlying_daily_change", "Sadece hisse günlük değişimi yüzünden elenenler"),
+    ("underlying_volume", "Sadece hisse hacmi yüzünden elenenler"),
+]
+
+CONTRACT_FILTER_ORDER = ("dte", "delta", "oi", "volume", "bid", "spread", "return")
 
 
 # --------------------------------------------------------------------------- yardımcılar
@@ -80,6 +105,19 @@ def to_date(value, tz) -> dt.date | None:
 def load_config(path: Path) -> dict:
     with open(path, encoding="utf-8") as fh:
         return yaml.safe_load(fh)
+
+
+def normalise_universe(raw) -> list[str]:
+    """YAML'da tırnaksız ON, NO, Y gibi yazılan semboller doğru/yanlış değerine dönüşür; bunu yakala."""
+    out = []
+    for item in raw or []:
+        if not isinstance(item, str):
+            raise ValueError(
+                f"config.yaml 'universe' listesinde sembol olmayan bir giriş var ({item!r}). "
+                "ON, NO, Y, N, OFF gibi semboller tırnak içinde yazılmalı, örneğin: - \"ON\""
+            )
+        out.append(item.strip().upper())
+    return out
 
 
 # --------------------------------------------------------------------------- IV geçmişi
@@ -142,6 +180,18 @@ def iv_metrics(history: IVHistory, symbol: str, today: dt.date, current: float |
     return {"status": "OK", "rank": rank, "pct": pct, "n": len(values)}
 
 
+def iv_passes(metrics: dict, icfg: dict) -> bool:
+    if metrics["status"] == "OK":
+        return metrics["rank"] > icfg["rank_gt"] and metrics["pct"] > icfg["percentile_gt"]
+    return icfg["when_insufficient_history"] != "reject"
+
+
+def apply_iv(cand: dict, metrics: dict) -> None:
+    cand["iv_status"], cand["iv_n"] = metrics["status"], metrics.get("n")
+    if metrics["status"] == "OK":
+        cand["iv_rank"], cand["iv_pct"] = metrics["rank"], metrics["pct"]
+
+
 # --------------------------------------------------------------------------- filtreler
 def check_underlying(quote: dict | None, ucfg: dict) -> tuple[dict, str | None]:
     info = {"last": None, "volume": None, "change_pct": None}
@@ -163,9 +213,27 @@ def check_underlying(quote: dict | None, ucfg: dict) -> tuple[dict, str | None]:
     return info, None
 
 
+def underlying_detail(reason: str, info: dict) -> str:
+    if reason == "price_range" and info.get("last") is not None:
+        return f"fiyat ${info['last']:,.2f}"
+    if reason == "underlying_volume":
+        vol = info.get("volume")
+        return "hacim yok" if vol is None else f"hacim {vol / 1e6:.2f}M"
+    if reason == "daily_change":
+        chg = info.get("change_pct")
+        return "değişim verisi yok" if chg is None else f"günlük {chg:+.1f}%"
+    return UNDERLYING_LABELS.get(reason, reason)
+
+
 def evaluate_contracts(rows: list[dict], symbol: str, spot: float, today: dt.date,
-                       cfg: dict, funnel: Counter) -> list[dict]:
+                       cfg: dict, funnel: Counter, near: list | None = None) -> list[dict]:
+    """Kontratları filtreler. Tüm filtreleri geçenleri döndürür.
+
+    `near` verilirse, yalnızca TEK bir kontrat filtresine takılan kontratlar (delta için
+    bandın hemen dışındakiler) oraya 'yakın kaçan' olarak eklenir.
+    """
     ocfg, rcfg = cfg["option"], cfg["return"]
+    delta_tol = cfg.get("output", {}).get("near_miss_delta_tolerance", 0.05)
     out = []
     for row in rows:
         funnel["contracts_total"] += 1
@@ -179,28 +247,12 @@ def evaluate_contracts(rows: list[dict], symbol: str, spot: float, today: dt.dat
             funnel["rej_missing"] += 1
             continue
         dte = (exp - today).days
-        if not (ocfg["dte_min"] <= dte <= ocfg["dte_max"]):
+        if dte <= 0:
             funnel["rej_dte"] += 1
             continue
         delta = -abs(delta)  # put delta'sı negatif kabul edilir
-        if not (ocfg["delta_min"] <= delta <= ocfg["delta_max"]):
-            funnel["rej_delta"] += 1
-            continue
-        oi = num(row.get("openInterest"))
-        if oi is None or oi < ocfg["open_interest_min"]:
-            funnel["rej_oi"] += 1
-            continue
-        volume = num(row.get("volume"))
-        if volume is None or volume < ocfg["option_volume_min"]:
-            funnel["rej_volume"] += 1
-            continue
-        if not bid > ocfg["bid_gt"]:
-            funnel["rej_bid"] += 1
-            continue
+        oi, volume = num(row.get("openInterest")), num(row.get("volume"))
         spread_pct = 100 * (ask - bid) / ask
-        if not spread_pct < ocfg["spread_pct_lt"]:
-            funnel["rej_spread"] += 1
-            continue
         premium = bid if rcfg["premium_basis"] == "bid" else (bid + ask) / 2
         base = strike if rcfg["base"] == "strike" else strike - premium
         if base <= 0:
@@ -208,10 +260,24 @@ def evaluate_contracts(rows: list[dict], symbol: str, spot: float, today: dt.dat
             continue
         static_return = premium / base
         annualized = static_return * 365 / dte * 100
+
+        fails: dict[str, str] = {}
+        if not (ocfg["dte_min"] <= dte <= ocfg["dte_max"]):
+            fails["dte"] = f"DTE {dte}"
+        if not (ocfg["delta_min"] <= delta <= ocfg["delta_max"]):
+            fails["delta"] = f"delta {delta:.2f} (bant {ocfg['delta_min']}…{ocfg['delta_max']})"
+        if oi is None or oi < ocfg["open_interest_min"]:
+            fails["oi"] = "OI yok" if oi is None else f"OI {oi:,.0f} < {ocfg['open_interest_min']}"
+        if volume is None or volume < ocfg["option_volume_min"]:
+            fails["volume"] = "hacim yok" if volume is None else f"hacim {volume:,.0f} < {ocfg['option_volume_min']}"
+        if not bid > ocfg["bid_gt"]:
+            fails["bid"] = f"bid {bid:.2f} ≤ {ocfg['bid_gt']}"
+        if not spread_pct < ocfg["spread_pct_lt"]:
+            fails["spread"] = f"spread %{spread_pct:.1f} ≥ %{ocfg['spread_pct_lt']}"
         if not annualized > rcfg["annualized_gt_pct"]:
-            funnel["rej_return"] += 1
-            continue
-        out.append({
+            fails["return"] = f"yıllık %{annualized:.1f} ≤ %{rcfg['annualized_gt_pct']}"
+
+        cand = {
             "symbol": symbol, "option_symbol": row.get("optionSymbol", ""), "spot": spot,
             "expiry": exp, "dte": dte, "strike": strike, "bid": bid, "ask": ask,
             "delta": delta, "iv": num(row.get("iv")), "open_interest": oi, "volume": volume,
@@ -220,7 +286,23 @@ def evaluate_contracts(rows: list[dict], symbol: str, spot: float, today: dt.dat
             "annualized_pct": annualized, "breakeven": strike - premium,
             "collateral": strike * 100, "earnings_date": None,
             "iv_status": None, "iv_rank": None, "iv_pct": None, "iv_n": None,
-        })
+            "miss_code": None, "miss_detail": "",
+        }
+        if not fails:
+            out.append(cand)
+            continue
+
+        first = next(code for code in CONTRACT_FILTER_ORDER if code in fails)
+        funnel["rej_" + first] += 1   # huni sayımı: ilk takılan filtre
+
+        if near is not None and len(fails) == 1:
+            code = first
+            if code == "dte":
+                continue
+            if code == "delta" and not (ocfg["delta_min"] - delta_tol <= delta <= ocfg["delta_max"] + delta_tol):
+                continue
+            cand["miss_code"], cand["miss_detail"] = code, fails[code]
+            near.append(cand)
     return out
 
 
@@ -228,8 +310,11 @@ def evaluate_contracts(rows: list[dict], symbol: str, spot: float, today: dt.dat
 @dataclass
 class ScanResult:
     candidates: list[dict] = field(default_factory=list)
+    near_misses: list[dict] = field(default_factory=list)
     funnel: Counter = field(default_factory=Counter)
     underlying_rejects: dict[str, str] = field(default_factory=dict)
+    underlying_info: dict[str, dict] = field(default_factory=dict)
+    earnings_unknown: list[str] = field(default_factory=list)
     errors: list[tuple[str, str]] = field(default_factory=list)
     symbols_total: int = 0
     symbols_scanned: int = 0
@@ -256,19 +341,26 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
 
         # IV geçmişini her hisse için biriktir (hisse filtresini geçmese bile)
         current_iv = iv_sample(rows, today, ocfg, icfg)
+        metrics = iv_metrics(history, symbol, today, current_iv, icfg)
         if current_iv is not None:
-            metrics = iv_metrics(history, symbol, today, current_iv, icfg)
             history.set(symbol, today, current_iv)
-        else:
-            metrics = iv_metrics(history, symbol, today, None, icfg)
 
         info, reason = check_underlying(quote, cfg["underlying"])
         if reason:
             result.underlying_rejects[symbol] = reason
+            result.underlying_info[symbol] = info
+            near_code = UNDERLYING_NEAR_CODE.get(reason)
+            if near_code and info["last"] is not None:
+                # Sadece hisse filtresi yüzünden elenen kontratlar (ana huniyi etkilemez, ek API çağrısı yok)
+                for cand in evaluate_contracts(rows, symbol, info["last"], today, cfg, Counter()):
+                    cand["miss_code"] = near_code
+                    cand["miss_detail"] = underlying_detail(reason, info)
+                    result.near_misses.append(cand)
             continue
 
-        candidates = evaluate_contracts(rows, symbol, info["last"], today, cfg, result.funnel)
-        if not candidates:
+        near_contracts: list[dict] = []
+        candidates = evaluate_contracts(rows, symbol, info["last"], today, cfg, result.funnel, near_contracts)
+        if not candidates and not near_contracts:
             continue
 
         # Earnings kuralı (sembol başına tek çağrı)
@@ -283,33 +375,53 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
         except MarketDataError as exc:
             earnings_failed = True
             result.errors.append((symbol, f"earnings alınamadı: {exc}"))
+        if next_earnings is None:
+            result.earnings_unknown.append(symbol)
+
+        def earnings_status(cand):
+            if next_earnings is None:
+                return "earnings_unknown" if (ecfg["require_known_date"] or earnings_failed) else None
+            return "earnings" if cand["expiry"] >= next_earnings else None
+
+        def earnings_detail(cand, status):
+            if status == "earnings":
+                return f"vade {cand['expiry']:%d.%m.%y} ≥ earnings {next_earnings:%d.%m.%y}"
+            return "earnings tarihi bulunamadı"
 
         kept = []
         for cand in candidates:
-            if next_earnings is None:
-                if ecfg["require_known_date"] or earnings_failed:
-                    result.funnel["rej_earnings_unknown"] += 1
-                    continue
-            elif cand["expiry"] >= next_earnings:
-                result.funnel["rej_earnings"] += 1
+            status = earnings_status(cand)
+            if status:
+                result.funnel["rej_" + status] += 1
+                cand["miss_code"], cand["miss_detail"] = status, earnings_detail(cand, status)
+                result.near_misses.append(cand)
                 continue
             cand["earnings_date"] = next_earnings
             kept.append(cand)
 
         # IV rank / percentile kuralı
         for cand in kept:
-            cand["iv_status"], cand["iv_n"] = metrics["status"], metrics.get("n")
-            if metrics["status"] == "OK":
-                cand["iv_rank"], cand["iv_pct"] = metrics["rank"], metrics["pct"]
-                if not (metrics["rank"] > icfg["rank_gt"] and metrics["pct"] > icfg["percentile_gt"]):
-                    result.funnel["rej_iv"] += 1
-                    continue
-            else:
+            apply_iv(cand, metrics)
+            if metrics["status"] != "OK":
                 result.iv_building = True
-                if icfg["when_insufficient_history"] == "reject":
-                    result.funnel["rej_iv"] += 1
-                    continue
+            if not iv_passes(metrics, icfg):
+                result.funnel["rej_iv"] += 1
+                if metrics["status"] == "OK":
+                    detail = f"IVR {metrics['rank']:.0f} / IVP {metrics['pct']:.0f}"
+                else:
+                    detail = f"IV geçmişi yetersiz ({metrics.get('n')} gün)"
+                cand["miss_code"], cand["miss_detail"] = "iv", detail
+                result.near_misses.append(cand)
+                continue
             all_candidates.append(cand)
+
+        # Tek kontrat filtresine takılanlar: earnings ve IV'yi de geçiyorlarsa gerçek "yakın kaçan"
+        for cand in near_contracts:
+            if earnings_status(cand) or not iv_passes(metrics, icfg):
+                continue
+            cand["earnings_date"] = next_earnings
+            apply_iv(cand, metrics)
+            result.near_misses.append(cand)
 
     # Sırala: yıllık getiri; hisse başına sınır; ilk N
     all_candidates.sort(key=lambda c: (-c["annualized_pct"], c["spread_pct"]))
@@ -326,6 +438,28 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
     return result
 
 
+def group_near_misses(result: ScanResult, cfg: dict) -> list[tuple[str, str, int, list[dict]]]:
+    """[(kod, başlık, toplam, gösterilecek kontratlar)] döndürür."""
+    per_reason = cfg.get("output", {}).get("near_miss_per_reason", 4)
+    per_symbol_cap = cfg.get("output", {}).get("near_miss_max_per_symbol", 2)
+    groups = []
+    for code, label in NEAR_LABELS:
+        items = [c for c in result.near_misses if c["miss_code"] == code]
+        if not items:
+            continue
+        items.sort(key=lambda c: (-c["annualized_pct"], c["spread_pct"]))
+        shown, count = [], Counter()
+        for c in items:
+            if count[c["symbol"]] >= per_symbol_cap:
+                continue
+            count[c["symbol"]] += 1
+            shown.append(c)
+            if len(shown) >= per_reason:
+                break
+        groups.append((code, label, len(items), shown))
+    return groups
+
+
 # --------------------------------------------------------------------------- rapor
 def fmt(value, digits=2, suffix=""):
     return "-" if value is None else f"{value:,.{digits}f}{suffix}"
@@ -337,6 +471,14 @@ def iv_text(c: dict) -> str:
     if c["iv_status"] == "BUILDING":
         return f"birikiyor ({c['iv_n']})"
     return "yok"
+
+
+def underlying_reject_groups(result: ScanResult) -> dict[str, list[str]]:
+    grouped: dict[str, list[str]] = {}
+    for symbol, reason in sorted(result.underlying_rejects.items(), key=lambda kv: str(kv[0])):
+        detail = underlying_detail(reason, result.underlying_info.get(symbol, {}))
+        grouped.setdefault(UNDERLYING_LABELS.get(reason, reason), []).append(f"{symbol} ({detail})")
+    return grouped
 
 
 def build_text(result: ScanResult, cfg: dict, today: dt.date) -> str:
@@ -353,9 +495,23 @@ def build_text(result: ScanResult, cfg: dict, today: dt.date) -> str:
     lines += ["", "Filtre özeti:"]
     for key, label in FUNNEL_LABELS:
         lines.append(f"  {label}: {result.funnel.get(key, 0)}")
-    if result.underlying_rejects:
+
+    groups = group_near_misses(result, cfg)
+    lines += ["", "Yakın kaçanlar (yalnızca tek bir filtreye takılanlar):"]
+    if not groups:
+        lines.append("  yok")
+    for _, label, total, shown in groups:
+        lines.append(f"  {label} - toplam {total} kontrat")
+        for c in shown:
+            lines.append(f"    {c['symbol']:<6} {c['expiry']:%d.%m.%y} ({c['dte']}g) strike {c['strike']:.2f} "
+                         f"bid {c['bid']:.2f} delta {c['delta']:.2f} yıllık %{c['annualized_pct']:.1f} "
+                         f"-> {c['miss_detail']}")
+    if result.earnings_unknown:
+        lines += ["", "Earnings tarihi bulunamayan hisseler: " + ", ".join(sorted(result.earnings_unknown, key=str))]
+    grouped = underlying_reject_groups(result)
+    if grouped:
         lines += ["", "Hisse filtresinde elenenler:"]
-        lines += [f"  {s}: {UNDERLYING_LABELS.get(r, r)}" for s, r in sorted(result.underlying_rejects.items())]
+        lines += [f"  {label}: {', '.join(items)}" for label, items in grouped.items()]
     if result.errors:
         lines += ["", "Hatalar:"] + [f"  {s}: {m}" for s, m in result.errors]
     lines += ["", "Bu liste bir araştırma çıktısıdır, yatırım tavsiyesi değildir."]
@@ -365,6 +521,7 @@ def build_text(result: ScanResult, cfg: dict, today: dt.date) -> str:
 def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
     esc = html.escape
     th = "padding:6px 8px;text-align:right;background:#1f3a5f;color:#fff;font-weight:600;white-space:nowrap"
+    th2 = th.replace("#1f3a5f", "#5b6b7f")
     td = "padding:5px 8px;text-align:right;border-bottom:1px solid #e3e6ea;white-space:nowrap"
     head = ["Hisse", "Fiyat", "Vade", "DTE", "Strike", "OTM%", "Bid", "Ask", "Spread%", "Delta", "IV",
             "IVR / IVP", "OI", "Hacim", "Yıllık%", "Başabaş", "Teminat", "Earnings"]
@@ -391,26 +548,48 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
             parts.append("<tr>" + "".join(f"<td style=\"{td}\">{v}</td>" for v in cells) + "</tr>")
         parts.append("</table>")
     else:
-        parts.append("<p><b>Bugün tüm filtreleri geçen aday bulunamadı.</b> Aşağıdaki özet nedenini gösterir.</p>")
+        parts.append("<p><b>Bugün tüm filtreleri geçen aday bulunamadı.</b> Aşağıdaki özet ve yakın kaçanlar nedenini gösterir.</p>")
 
-    parts.append("<h3 style=\"margin:18px 0 6px\">Filtre özeti</h3><table style=\"border-collapse:collapse;font-size:12px\">")
+    # Yakın kaçanlar
+    parts.append("<h3 style=\"margin:20px 0 4px\">Yakın kaçanlar</h3>"
+                 "<p style=\"margin:0 0 8px;color:#555\">Yalnızca <b>tek bir</b> filtreye takılıp elenen kontratlar. "
+                 "Hangi kuralı gevşetirsen hangi kontratların girebileceğini gösterir.</p>")
+    groups = group_near_misses(result, cfg)
+    if not groups:
+        parts.append("<p style=\"color:#555\">Yok.</p>")
+    near_head = ["Hisse", "Vade", "DTE", "Strike", "Bid", "Delta", "OTM%", "Yıllık%", "Takıldığı yer"]
+    for _, label, total, shown in groups:
+        parts.append(f"<p style=\"margin:12px 0 4px\"><b>{esc(label)}</b> — toplam {total} kontrat"
+                     f"{'' if total == len(shown) else f' (en iyi {len(shown)} gösteriliyor)'}</p>")
+        parts.append("<table style=\"border-collapse:collapse;font-size:12px\"><tr>")
+        parts += [f"<th style=\"{th2}\">{h}</th>" for h in near_head]
+        parts.append("</tr>")
+        for c in shown:
+            cells = [f"<b>{esc(c['symbol'])}</b>", f"{c['expiry']:%d.%m.%y}", str(c["dte"]), fmt(c["strike"]),
+                     fmt(c["bid"]), fmt(c["delta"]), fmt(c["otm_pct"], 1), f"<b>{c['annualized_pct']:.1f}</b>",
+                     esc(c["miss_detail"])]
+            parts.append("<tr>" + "".join(f"<td style=\"{td}\">{v}</td>" for v in cells) + "</tr>")
+        parts.append("</table>")
+    if result.earnings_unknown:
+        parts.append("<p style=\"margin:12px 0 0\"><b>Earnings tarihi bulunamayan hisseler:</b> "
+                     + esc(", ".join(sorted(result.earnings_unknown, key=str))) + "</p>")
+
+    parts.append("<h3 style=\"margin:20px 0 6px\">Filtre özeti</h3><table style=\"border-collapse:collapse;font-size:12px\">")
     for key, label in FUNNEL_LABELS:
         weight = "font-weight:700" if key == "passed" else ""
         parts.append(f"<tr><td style=\"padding:3px 12px 3px 0;{weight}\">{esc(label)}</td>"
                      f"<td style=\"padding:3px 0;text-align:right;{weight}\">{result.funnel.get(key, 0)}</td></tr>")
     parts.append("</table>")
 
-    if result.underlying_rejects:
-        grouped: dict[str, list[str]] = {}
-        for symbol, reason in sorted(result.underlying_rejects.items()):
-            grouped.setdefault(UNDERLYING_LABELS.get(reason, reason), []).append(symbol)
+    grouped = underlying_reject_groups(result)
+    if grouped:
         parts.append("<h3 style=\"margin:18px 0 6px\">Hisse filtresinde elenenler</h3><ul style=\"margin:0;padding-left:18px\">")
-        parts += [f"<li><b>{esc(label)}:</b> {esc(', '.join(syms))}</li>" for label, syms in grouped.items()]
+        parts += [f"<li><b>{esc(label)}:</b> {esc(', '.join(items))}</li>" for label, items in grouped.items()]
         parts.append("</ul>")
 
     if result.errors:
         parts.append("<h3 style=\"margin:18px 0 6px;color:#a33\">Hatalar</h3><ul style=\"margin:0;padding-left:18px\">")
-        parts += [f"<li>{esc(s)}: {esc(m)}</li>" for s, m in result.errors]
+        parts += [f"<li>{esc(str(s))}: {esc(m)}</li>" for s, m in result.errors]
         parts.append("</ul>")
 
     icfg = cfg["iv"]
@@ -420,6 +599,7 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
         "Earnings: sonraki tarih biliniyor ve vade bu tarihten kesinlikle önce olmalı.",
         f"IVR/IVP: kendi biriktirdiğimiz IV geçmişinden hesaplanır (en az {icfg['min_history_days']} gün gerekir). "
         "'birikiyor (n)' yazıyorsa filtre henüz uygulanmıyor, değer birikme aşamasında.",
+        "Yakın kaçan = yalnızca tek bir filtreye takılan kontrat. Hisse filtresi yüzünden elenenlerde earnings/IV kontrol edilmez.",
         "Piyasa değeri (5 milyar $) filtresi uygulanmıyor; evren önceden seçilmiş büyük şirketlerden oluşuyor.",
         "Bu liste bir araştırma çıktısıdır, yatırım tavsiyesi değildir.",
     ]
@@ -433,13 +613,17 @@ def write_outputs(result: ScanResult, cfg: dict, today: dt.date, outdir: Path) -
     outdir.mkdir(parents=True, exist_ok=True)
     (outdir / "report.html").write_text(build_html(result, cfg, today), encoding="utf-8")
     (outdir / "report.txt").write_text(build_text(result, cfg, today), encoding="utf-8")
+    cols = ["symbol", "option_symbol", "spot", "expiry", "dte", "strike", "bid", "ask", "delta", "iv",
+            "open_interest", "volume", "spread_pct", "otm_pct", "annualized_pct", "breakeven",
+            "collateral", "earnings_date", "iv_status", "iv_rank", "iv_pct"]
     with open(outdir / "candidates.csv", "w", newline="", encoding="utf-8") as fh:
-        cols = ["symbol", "option_symbol", "spot", "expiry", "dte", "strike", "bid", "ask", "delta", "iv",
-                "open_interest", "volume", "spread_pct", "otm_pct", "annualized_pct", "breakeven",
-                "collateral", "earnings_date", "iv_status", "iv_rank", "iv_pct"]
         writer = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(result.candidates)
+    with open(outdir / "near_misses.csv", "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=cols + ["miss_code", "miss_detail"], extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(result.near_misses)
 
 
 # --------------------------------------------------------------------------- ana akış
@@ -459,7 +643,12 @@ def main(argv=None) -> int:
         return 2
 
     today = dt.datetime.now(NY).date()
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()] or list(cfg["universe"])
+    try:
+        override = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+        symbols = override or normalise_universe(cfg["universe"])
+    except ValueError as exc:
+        print(f"HATA: {exc}", file=sys.stderr)
+        return 2
     md = MarketData(token, max_calls=cfg["safety"]["max_api_calls"],
                     mode=cfg["marketdata"]["mode"], maxage=cfg["marketdata"]["maxage"])
 
