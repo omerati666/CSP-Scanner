@@ -599,101 +599,266 @@ def build_text(result: ScanResult, cfg: dict, today: dt.date) -> str:
     return "\n".join(lines)
 
 
-def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
+# --------------------------------------------------------------------------- HTML tasarımı
+# E-posta istemcileri (Gmail vb.) için güvenli: tablo düzeni + satır içi (inline) stiller, script yok.
+TR_MONTHS = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim",
+             "Kasım", "Aralık"]
+TR_DAYS = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"]
+FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
+INK, MUTED, LINE, PAGE, NAVY = "#1c2733", "#6b7785", "#e3e8ee", "#eef1f5", "#0f2740"
+
+
+def tr_date(day: dt.date) -> str:
+    return f"{day.day} {TR_MONTHS[day.month - 1]} {day.year}, {TR_DAYS[day.weekday()]}"
+
+
+def _chip(text: str, bg: str, fg: str, title: str = "", extra: str = "") -> str:
+    t = f' title="{html.escape(title, quote=True)}"' if title else ""
+    return (f'<span{t} style="display:inline-block;padding:1px 8px;border-radius:10px;background:{bg};color:{fg};'
+            f'font-size:11px;font-weight:600;line-height:17px;white-space:nowrap;margin:0 4px 4px 0;{extra}">'
+            f'{html.escape(text)}</span>')
+
+
+def _cell(top: str, sub: str = "", align: str = "right", wrap: bool = False) -> str:
+    sub_html = (f'<div style="font-size:11px;line-height:14px;color:{MUTED};margin-top:1px">{sub}</div>'
+                if sub else "")
+    nowrap = "" if wrap else "white-space:nowrap;"
+    return (f'<td align="{align}" style="padding:7px 8px;text-align:{align};vertical-align:middle;{nowrap}'
+            f'border-bottom:1px solid {LINE}"><div style="font-size:13px;line-height:17px;color:{INK}">{top}</div>'
+            f'{sub_html}</td>')
+
+
+def _th(label: str, align: str = "right") -> str:
+    return (f'<th align="{align}" style="padding:8px;text-align:{align};font-size:10.5px;font-weight:700;color:{MUTED};'
+            f'text-transform:uppercase;letter-spacing:.6px;background:#f6f8fb;border-bottom:1px solid {LINE};'
+            f'white-space:nowrap">{html.escape(label)}</th>')
+
+
+def _card(title: str, body: str, subtitle: str = "") -> str:
+    sub = f'<div style="font-size:12px;color:{MUTED};margin-top:3px;line-height:17px">{subtitle}</div>' if subtitle else ""
+    return (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#ffffff;'
+            f'border:1px solid {LINE};border-radius:10px;margin:0 0 14px"><tr><td style="padding:16px 18px">'
+            f'<div style="font-size:15px;font-weight:700;color:{INK}">{title}</div>{sub}'
+            f'<div style="margin-top:12px">{body}</div></td></tr></table>')
+
+
+def _kpi(label: str, value: str, sub: str = "") -> str:
+    sub_html = f'<div style="font-size:11px;color:{MUTED};margin-top:2px;line-height:14px">{sub}</div>' if sub else ""
+    return (f'<td width="25%" valign="top" style="padding:0 4px"><div style="background:#ffffff;border:1px solid {LINE};'
+            f'border-radius:10px;padding:12px 14px"><div style="font-size:10.5px;font-weight:700;color:{MUTED};'
+            f'letter-spacing:.7px;text-transform:uppercase">{html.escape(label)}</div>'
+            f'<div style="font-size:22px;font-weight:700;color:{INK};margin-top:4px;line-height:26px">{value}</div>'
+            f'{sub_html}</div></td>')
+
+
+def _warn_chip(note: str) -> str:
+    if "kapsıyor" in note:
+        return _chip("⚠ vade kapsıyor", "#fff3d6", "#8a5a00", note)
+    if "alınamadı" in note:
+        return _chip("⚠ tarih alınamadı", "#fde8e8", "#a12626", note)
+    return _chip("⚠ tarih bilinmiyor", "#fff3d6", "#8a5a00", note)
+
+
+def _candidate_row(c: dict, idx: int, min_hist: int) -> str:
     esc = html.escape
-    th = "padding:6px 8px;text-align:right;background:#1f3a5f;color:#fff;font-weight:600;white-space:nowrap"
-    th2 = th.replace("#1f3a5f", "#5b6b7f")
-    td = "padding:5px 8px;text-align:right;border-bottom:1px solid #e3e6ea;white-space:nowrap"
-    head = ["Hisse", "Fiyat", "Vade", "DTE", "Strike", "OTM%", "Bid", "Ask", "Spread%", "Delta", "IV",
-            "IVR / IVP", "OI", "Hacim", "Yıllık%", "Başabaş", "Teminat", "Earnings", "Uyarı"]
-    parts = [
-        "<div style=\"font-family:Arial,Helvetica,sans-serif;color:#222;font-size:13px\">",
-        f"<h2 style=\"margin:0 0 4px\">CSP Scanner — {today:%d.%m.%Y}</h2>",
-        f"<p style=\"margin:0 0 12px;color:#555\"><b>{len(result.candidates)}</b> aday · "
-        f"{result.symbols_scanned}/{result.symbols_total} hisse tarandı · {result.api_calls} API çağrısı</p>",
-    ]
-    if result.candidates:
-        parts.append("<table style=\"border-collapse:collapse;font-size:12px\"><tr>")
-        parts += [f"<th style=\"{th}\">{h}</th>" for h in head]
-        parts.append("</tr>")
-        for c in result.candidates:
-            earnings = f"{c['earnings_date']:%d.%m.%y}" if c["earnings_date"] else "-"
-            cells = [
-                f"<b>{esc(c['symbol'])}</b>", fmt(c["spot"]), f"{c['expiry']:%d.%m.%y}", str(c["dte"]),
-                fmt(c["strike"]), fmt(c["otm_pct"], 1), fmt(c["bid"]), fmt(c["ask"]),
-                fmt(c["spread_pct"], 1), fmt(c["delta"]),
-                fmt(c["iv"] * 100 if c["iv"] is not None else None, 0, "%"),
-                esc(iv_text(c)), fmt(c["open_interest"], 0), fmt(c["volume"], 0),
-                f"<b>{c['annualized_pct']:.1f}</b>", fmt(c["breakeven"]), f"${c['collateral']:,.0f}", earnings,
-                (f"<span style=\"color:#b45309;font-weight:600\">⚠ {esc(c['earnings_note'])}</span>"
-                 if c.get("earnings_note") else ""),
-            ]
-            parts.append("<tr>" + "".join(f"<td style=\"{td}\">{v}</td>" for v in cells) + "</tr>")
-        parts.append("</table>")
+    bg = "#ffffff" if idx % 2 == 0 else "#fafbfd"
+    earn = f"{c['earnings_date']:%d.%m.%y}" if c["earnings_date"] else "—"
+    note = c.get("earnings_note", "")
+    if c["iv_status"] == "OK":
+        iv_top, iv_sub = f"{c['iv_rank']:.0f} / {c['iv_pct']:.0f}", f"{c['iv_n']} gün"
+    elif c["iv_status"] == "BUILDING":
+        iv_top, iv_sub = f'<span style="color:{MUTED}">birikiyor</span>', f"{c['iv_n']}/{min_hist} gün"
     else:
-        parts.append("<p><b>Bugün tüm filtreleri geçen aday bulunamadı.</b> Aşağıdaki özet ve yakın kaçanlar nedenini gösterir.</p>")
+        iv_top, iv_sub = "—", ""
+    iv_pct = f"IV %{c['iv'] * 100:.0f}" if c.get("iv") is not None else "IV —"
+    pill = (f'<span style="display:inline-block;padding:2px 9px;border-radius:6px;background:#e3f4ea;color:#146c3a;'
+            f'font-weight:700;font-size:13px">%{c["annualized_pct"]:.1f}</span>')
+    cells = [
+        _cell(f'<b style="font-size:14px">{esc(c["symbol"])}</b>', f"${c['spot']:,.2f}", "left"),
+        _cell(f"{c['expiry']:%d.%m.%y}", f"{c['dte']} gün", "left"),
+        _cell(f"<b>{c['strike']:,.2f}</b>", f"OTM %{c['otm_pct']:.1f}"),
+        _cell(f"{c['bid']:.2f} / {c['ask']:.2f}", f"spread %{c['spread_pct']:.1f}"),
+        _cell(f"{c['delta']:.2f}", iv_pct),
+        _cell(fmt(c["open_interest"], 0), f"hacim {fmt(c['volume'], 0)}"),
+        _cell(pill, f"dönem %{c['static_return_pct']:.2f}"),
+        _cell(f"${c['collateral']:,.0f}", f"başabaş {c['breakeven']:,.2f}"),
+        _cell(earn, _warn_chip(note) if note else "", "left"),
+        _cell(iv_top, iv_sub),
+    ]
+    return f'<tr style="background:{bg}">' + "".join(cells) + "</tr>"
 
-    # Yakın kaçanlar
-    parts.append("<h3 style=\"margin:20px 0 4px\">Yakın kaçanlar</h3>"
-                 "<p style=\"margin:0 0 8px;color:#555\">Yalnızca <b>tek bir</b> filtreye takılıp elenen kontratlar. "
-                 "Hangi kuralı gevşetirsen hangi kontratların girebileceğini gösterir.</p>")
-    groups = group_near_misses(result, cfg)
-    if not groups:
-        parts.append("<p style=\"color:#555\">Yok.</p>")
-    near_head = ["Hisse", "Vade", "DTE", "Strike", "Bid", "Delta", "OTM%", "Yıllık%", "Takıldığı yer"]
-    for _, label, total, shown in groups:
-        parts.append(f"<p style=\"margin:12px 0 4px\"><b>{esc(label)}</b> — toplam {total} kontrat"
-                     f"{'' if total == len(shown) else f' (en iyi {len(shown)} gösteriliyor)'}</p>")
-        parts.append("<table style=\"border-collapse:collapse;font-size:12px\"><tr>")
-        parts += [f"<th style=\"{th2}\">{h}</th>" for h in near_head]
-        parts.append("</tr>")
-        for c in shown:
-            cells = [f"<b>{esc(c['symbol'])}</b>", f"{c['expiry']:%d.%m.%y}", str(c["dte"]), fmt(c["strike"]),
-                     fmt(c["bid"]), fmt(c["delta"]), fmt(c["otm_pct"], 1), f"<b>{c['annualized_pct']:.1f}</b>",
-                     esc(c["miss_detail"])]
-            parts.append("<tr>" + "".join(f"<td style=\"{td}\">{v}</td>" for v in cells) + "</tr>")
-        parts.append("</table>")
-    if result.earnings_unknown:
-        parts.append("<p style=\"margin:12px 0 0\"><b>Earnings tarihi bulunamayan hisseler:</b> "
-                     + esc(", ".join(sorted(result.earnings_unknown, key=str))) + "</p>")
 
-    parts.append("<h3 style=\"margin:20px 0 6px\">Filtre özeti</h3><table style=\"border-collapse:collapse;font-size:12px\">")
+def _near_table(shown: list[dict]) -> str:
+    esc = html.escape
+    widths = (11, 12, 11, 9, 9, 9, 10, 29)   # sütun genişlikleri (%), tüm yakın kaçan tablolarında aynı
+    head = "".join(_th(lbl, al).replace("<th ", f'<th width="{w}%" ', 1) for (lbl, al), w in zip(
+        [("Hisse", "left"), ("Vade", "left"), ("Strike", "right"), ("Bid", "right"), ("Delta", "right"),
+         ("OTM", "right"), ("Yıllık", "right"), ("Takıldığı yer", "left")], widths))
+    rows = []
+    for i, c in enumerate(shown):
+        bg = "#ffffff" if i % 2 == 0 else "#fafbfd"
+        cells = [
+            _cell(f"<b>{esc(c['symbol'])}</b>", "", "left"),
+            _cell(f"{c['expiry']:%d.%m.%y}", f"{c['dte']} gün", "left"),
+            _cell(f"{c['strike']:,.2f}"), _cell(f"{c['bid']:.2f}"), _cell(f"{c['delta']:.2f}"),
+            _cell(f"%{c['otm_pct']:.1f}"), _cell(f"<b>%{c['annualized_pct']:.1f}</b>"),
+            _cell(f'<span style="color:#8a5a00">{esc(c["miss_detail"])}</span>', "", "left", wrap=True),
+        ]
+        rows.append(f'<tr style="background:{bg}">' + "".join(cells) + "</tr>")
+    return (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            f'style="table-layout:fixed;border:1px solid {LINE};border-radius:8px;border-collapse:separate;border-spacing:0">'
+            f'<tr>{head}</tr>{"".join(rows)}</table>')
+
+
+def _funnel(result: "ScanResult") -> str:
+    esc = html.escape
+    total = max(result.funnel.get("contracts_total", 0), 1)
+    rows = []
     for key, label in FUNNEL_LABELS:
-        weight = "font-weight:700" if key == "passed" else ""
-        parts.append(f"<tr><td style=\"padding:3px 12px 3px 0;{weight}\">{esc(label)}</td>"
-                     f"<td style=\"padding:3px 0;text-align:right;{weight}\">{result.funnel.get(key, 0)}</td></tr>")
-    parts.append("</table>")
+        n = result.funnel.get(key, 0)
+        if key == "contracts_total":
+            color = "#9fb3c8"
+        elif key == "passed":
+            color = "#2e9e63"
+        elif key.startswith("warn_"):
+            color = "#e0a100"
+        else:
+            color = "#c3cfdb"
+        pct = max(n / total * 100, 1.0) if n else 0
+        bar = f'<div style="height:8px;border-radius:4px;background:{color};width:{pct:.1f}%"></div>' if n else ""
+        strong = key in ("passed", "contracts_total")
+        tint = INK if (n or strong) else "#9aa5b1"
+        weight = "700" if strong else "400"
+        rows.append(
+            f'<tr><td style="padding:5px 0;font-size:12px;color:{tint};font-weight:{weight}">{esc(label)}</td>'
+            f'<td align="right" style="padding:5px 12px;font-size:12px;color:{tint};font-weight:{weight}">{n:,}</td>'
+            f'<td width="40%" style="padding:5px 0"><div style="height:8px;border-radius:4px;background:#f1f4f8">{bar}</div></td></tr>')
+    out = f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{"".join(rows)}</table>'
     detail = missing_breakdown(result)
     if detail:
-        parts.append(f"<p style=\"margin:6px 0 0;color:#555;font-size:12px\">Eksik veri dökümü "
-                     f"(bir kontrat birden fazla alanda eksik olabilir): {esc(detail)}</p>")
+        out += (f'<div style="margin-top:8px;font-size:11.5px;color:{MUTED}">Eksik veri dökümü '
+                f'(bir kontrat birden fazla alanda eksik olabilir): {esc(detail)}</div>')
+    return out
 
+
+def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
+    esc = html.escape
+    min_hist = cfg["iv"]["min_history_days"]
+    passed = result.funnel.get("passed", 0)
+    evaluated = result.symbols_scanned - len(result.underlying_rejects)
+    warn_rows = sum(1 for c in result.candidates if c.get("earnings_note"))
+
+    # ---- başlık bandı + özet kutuları
+    header = (
+        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{NAVY};'
+        f'border-radius:10px;margin:0 0 12px"><tr><td style="padding:22px 24px">'
+        f'<div style="font-size:11px;letter-spacing:1.6px;color:#8fb3d9;font-weight:700">CASH SECURED PUT TARAMASI</div>'
+        f'<div style="font-size:26px;font-weight:700;color:#ffffff;margin-top:4px;line-height:30px">CSP Scanner</div>'
+        f'<div style="font-size:13px;color:#c5d5e6;margin-top:4px">{tr_date(today)} · {result.api_calls} API çağrısı</div>'
+        f'</td><td align="right" valign="middle" style="padding:22px 24px">'
+        f'<div style="font-size:38px;font-weight:700;color:#ffffff;line-height:40px">{len(result.candidates)}</div>'
+        f'<div style="font-size:11px;letter-spacing:1.2px;color:#8fb3d9;font-weight:700">ADAY</div></td></tr></table>')
+    kpis = (
+        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 -4px 14px;'
+        f'width:calc(100% + 8px)"><tr>'
+        + _kpi("Taranan hisse", f"{result.symbols_scanned}<span style='font-size:14px;color:{MUTED}'>/{result.symbols_total}</span>")
+        + _kpi("Değerlendirilen", f"{evaluated}", "hisse filtresini geçti")
+        + _kpi("İncelenen kontrat", f"{result.funnel.get('contracts_total', 0):,}", "put, vade ve delta dahil")
+        + _kpi("Filtreyi geçen", f"{passed:,}",
+               f"mailde en iyi {len(result.candidates)}" if passed > len(result.candidates) else "kontrat")
+        + "</tr></table>")
+
+    # ---- adaylar
+    if result.candidates:
+        head = "".join([_th("Hisse", "left"), _th("Vade", "left"), _th("Strike"), _th("Bid / Ask"),
+                        _th("Delta / IV"), _th("OI / Hacim"), _th("Yıllık"), _th("Teminat"),
+                        _th("Earnings", "left"), _th("IVR / IVP")])
+        rows = "".join(_candidate_row(c, i, min_hist) for i, c in enumerate(result.candidates))
+        body = (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+                f'style="border:1px solid {LINE};border-radius:8px;border-collapse:separate;border-spacing:0">'
+                f'<tr>{head}</tr>{rows}</table>')
+        legend = []
+        if warn_rows:
+            legend.append(f"{_chip('⚠ vade kapsıyor', '#fff3d6', '#8a5a00')} opsiyonun vadesi earnings tarihinden sonra, "
+                          "pozisyon açıklamayı açık taşır.")
+            legend.append(f"{_chip('⚠ tarih bilinmiyor', '#fff3d6', '#8a5a00')} MarketData sonraki earnings tarihini "
+                          "vermedi, kendin doğrula.")
+        if result.earnings_unknown:
+            chips = "".join(_chip(s, "#fff3d6", "#8a5a00") for s in sorted(result.earnings_unknown, key=str))
+            legend.append(f"<b>Earnings tarihi bulunamayan hisseler:</b> {chips}")
+        if legend:
+            body += (f'<div style="margin-top:10px;font-size:11.5px;line-height:20px;color:{MUTED}">'
+                     + "<br>".join(legend) + "</div>")
+        cards = _card("Adaylar", body, "Yıllık getiriye göre sıralı. Yıllık = bid / strike × 365 / DTE · "
+                                       "Teminat = strike × 100 · Başabaş = strike − bid")
+    else:
+        cards = _card("Adaylar",
+                      f'<div style="background:#f6f8fb;border:1px dashed #c3cfdb;border-radius:8px;padding:16px;'
+                      f'font-size:13px;color:{INK}"><b>Bugün tüm filtreleri geçen aday bulunamadı.</b> '
+                      f'Aşağıdaki yakın kaçanlar ve filtre özeti nedenini gösterir.</div>')
+
+    # ---- yakın kaçanlar
+    groups = group_near_misses(result, cfg)
+    if groups:
+        near = ""
+        for _, label, total, shown in groups:
+            extra = "" if total == len(shown) else f" · en iyi {len(shown)}"
+            near += (f'<div style="margin:16px 0 6px;font-size:12.5px;font-weight:700;color:{INK}">{esc(label)} '
+                     f'{_chip(f"toplam {total}{extra}", "#eef2f7", "#44566c")}</div>{_near_table(shown)}')
+    else:
+        near = f'<div style="font-size:12.5px;color:{MUTED}">Yok.</div>'
+    cards += _card("Yakın kaçanlar", near.replace('margin:16px 0 6px', 'margin:0 0 6px', 1) if groups else near,
+                   "Yalnızca <b>tek bir</b> filtreye takılıp elenen kontratlar. Hangi kuralı gevşetirsen hangi "
+                   "kontratların girebileceğini gösterir.")
+
+    # ---- filtre özeti + hisse filtresi
+    cards += _card("Filtre özeti", _funnel(result), "Kontrat düzeyinde: her kontrat takıldığı ilk filtreye sayılır.")
     grouped = underlying_reject_groups(result)
     if grouped:
-        parts.append("<h3 style=\"margin:18px 0 6px\">Hisse filtresinde elenenler</h3><ul style=\"margin:0;padding-left:18px\">")
-        parts += [f"<li><b>{esc(label)}:</b> {esc(', '.join(items))}</li>" for label, items in grouped.items()]
-        parts.append("</ul>")
+        blocks = ""
+        for label, items in grouped.items():
+            chips = "".join(_chip(i, "#eef2f7", "#44566c") for i in items)
+            blocks += (f'<div style="margin:0 0 8px"><div style="font-size:12px;font-weight:700;color:{INK};'
+                       f'margin-bottom:4px">{esc(label)} <span style="color:{MUTED};font-weight:400">· {len(items)}</span></div>'
+                       f'{chips}</div>')
+        cards += _card("Hisse filtresinde elenenler", blocks, "Bu hisselerin kontratları hiç değerlendirilmedi.")
 
+    # ---- hatalar
     if result.errors:
-        parts.append("<h3 style=\"margin:18px 0 6px;color:#a33\">Hatalar</h3><ul style=\"margin:0;padding-left:18px\">")
-        parts += [f"<li>{esc(str(s))}: {esc(m)}</li>" for s, m in result.errors]
-        parts.append("</ul>")
+        errs = "".join(f"<li>{esc(str(s))}: {esc(m)}</li>" for s, m in result.errors)
+        cards += (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#fdf0f0;'
+                  f'border:1px solid #f1c6c6;border-radius:10px;margin:0 0 14px"><tr><td style="padding:14px 18px">'
+                  f'<div style="font-size:14px;font-weight:700;color:#a12626">Hatalar</div>'
+                  f'<ul style="margin:8px 0 0;padding-left:18px;font-size:12px;color:#7a2020">{errs}</ul></td></tr></table>')
 
+    # ---- notlar
     icfg = cfg["iv"]
     notes = [
         "Veri: MarketData cached modu (en fazla ~20 dk gecikmeli olabilir). Emir vermeden önce güncel fiyatı broker'ında kontrol et.",
-        "Yıllık getiri = bid / strike × 365 / DTE. Teminat = strike × 100. Başabaş = strike − bid.",
         earnings_note_text(cfg),
         f"IVR/IVP: kendi biriktirdiğimiz IV geçmişinden hesaplanır (en az {icfg['min_history_days']} gün gerekir). "
-        "'birikiyor (n)' yazıyorsa filtre henüz uygulanmıyor, değer birikme aşamasında.",
+        "'birikiyor' yazıyorsa filtre henüz uygulanmıyor.",
         "Yakın kaçan = yalnızca tek bir filtreye takılan kontrat. Hisse filtresi yüzünden elenenlerde earnings/IV kontrol edilmez.",
-        "Piyasa değeri (5 milyar $) filtresi uygulanmıyor; evren önceden seçilmiş büyük şirketlerden oluşuyor.",
-        "Bu liste bir araştırma çıktısıdır, yatırım tavsiyesi değildir.",
+        "Piyasa değeri (5 milyar $) filtresi uygulanmıyor; evren sana ait takip listesinden oluşuyor.",
     ]
-    parts.append("<h3 style=\"margin:18px 0 6px\">Notlar</h3><ul style=\"margin:0;padding-left:18px;color:#555\">")
-    parts += [f"<li>{esc(n)}</li>" for n in notes]
-    parts.append("</ul></div>")
-    return "".join(parts)
+    note_html = "".join(f"<li style='margin-bottom:3px'>{esc(n)}</li>" for n in notes)
+    footer = (f'<div style="padding:4px 6px 0;font-size:11.5px;line-height:17px;color:{MUTED}">'
+              f'<div style="font-weight:700;margin-bottom:4px">Notlar</div>'
+              f'<ul style="margin:0 0 12px;padding-left:18px">{note_html}</ul>'
+              f'<div style="border-top:1px solid {LINE};padding-top:10px">CSP Scanner · MarketData verisi · '
+              f'Bu liste bir araştırma çıktısıdır, yatırım tavsiyesi değildir.</div></div>')
+
+    inner = header + kpis + cards + footer
+    return ('<!DOCTYPE html><html lang="tr"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<meta name="color-scheme" content="light"><meta name="supported-color-schemes" content="light">'
+            f'<title>CSP Scanner {today:%d.%m.%Y}</title></head>'
+            f'<body style="margin:0;padding:0;background:{PAGE}">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{PAGE}">'
+            f'<tr><td align="center" style="padding:20px 12px">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            f'style="max-width:900px;font-family:{FONT};color:{INK}"><tr><td>{inner}</td></tr></table>'
+            f'</td></tr></table></body></html>')
 
 
 def write_outputs(result: ScanResult, cfg: dict, today: dt.date, outdir: Path) -> None:

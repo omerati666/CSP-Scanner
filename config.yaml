@@ -88,8 +88,9 @@ underlying:
   price_min: 20
   price_max: 300
   volume_gt: 1000000       # günlük hisse hacmi > 1 milyon (gün içi çalışırsa o ana kadarki hacim)
-  daily_change_pct_min: -3 # günlük değişim -%3 ile +%3 arasında
-  daily_change_pct_max: 3
+  # Günlük değişim filtresi KAPALI (-100 / 100 = fiilen sınırsız). Tekrar açmak için ör. -3 ve 3 yaz.
+  daily_change_pct_min: -100
+  daily_change_pct_max: 100
   # market_cap_min (5 milyar $): MarketData bu bilgiyi vermiyor, bu yüzden uygulanmıyor.
 
 # Earnings kuralı
