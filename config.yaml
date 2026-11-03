@@ -83,7 +83,7 @@ option:
   delta_max: -0.15
   open_interest_min: 300   # open interest >= 300
   option_volume_min: 25    # günlük opsiyon hacmi >= 25
-  bid_gt: 0.75             # bid > 0.75
+  bid_gt: 0.50             # bid > 0.50
   spread_pct_lt: 10        # (ask - bid) / ask * 100 < 10
 
 # Hisse (underlying) filtreleri
