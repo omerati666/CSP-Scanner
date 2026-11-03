@@ -202,10 +202,21 @@ def earnings_rules(cfg: dict) -> dict:
         "expiry_before": e.get("expiry_before_earnings", False),  # True: vade de earnings'ten önce olmalı
         "unknown": e.get("when_date_unknown", "warn"),            # warn = uyarıyla listele, reject = ele
         "lookahead": e.get("lookahead_days", 180),
+        "lookback": e.get("lookback_days", 120),                  # son açıklama tarihi için geriye bakış
     }
 
 
-def mark_earnings(cand: dict, next_earnings: dt.date | None, unknown_note: str) -> None:
+def etf_set(cfg: dict) -> set[str]:
+    return {x.upper() for x in (cfg.get("etf_symbols") or []) if isinstance(x, str)}
+
+
+def mark_earnings(cand: dict, next_earnings: dt.date | None, unknown_note: str,
+                  last_earnings: dt.date | None = None, is_etf: bool = False) -> None:
+    cand["is_etf"] = is_etf
+    cand["last_earnings"] = last_earnings
+    if is_etf:
+        cand["earnings_date"], cand["spans_earnings"], cand["earnings_note"] = None, False, ""
+        return
     cand["earnings_date"] = next_earnings
     cand["spans_earnings"] = bool(next_earnings and cand["expiry"] >= next_earnings)
     if next_earnings is None:
@@ -225,6 +236,9 @@ def earnings_note_text(cfg: dict) -> str:
         text += " Vade earnings'i kapsayabilir; böyle satırlar 'vade earnings'i kapsıyor' diye işaretlenir."
     text += (" Tarihi bulunamayan hisseler 'earnings bilinmiyor' uyarısıyla listelenir."
              if r["unknown"] == "warn" else " Tarihi bulunamayan hisseler elenir.")
+    etfs = sorted(etf_set(cfg))
+    if etfs:
+        text += f" ETF listesindekiler ({', '.join(etfs)}) earnings kuralından muaftır."
     return text
 
 
@@ -285,7 +299,9 @@ def score_candidate(c: dict, cfg: dict) -> tuple[int | None, dict]:
     if oi is not None:
         liq.append(_lin(oi, s["oi_zero_at"], s["oi_full_at"]))
     parts["liquidity"] = sum(liq) / len(liq)
-    if c.get("earnings_date") is None:
+    if c.get("is_etf"):
+        parts["earnings"] = None
+    elif c.get("earnings_date") is None:
         parts["earnings"] = float(s["earnings_unknown"])
     elif c.get("spans_earnings"):
         parts["earnings"] = float(s["earnings_spans"])
@@ -419,7 +435,7 @@ def evaluate_contracts(rows: list[dict], symbol: str, spot: float, today: dt.dat
             "spread_pct": spread_pct, "otm_pct": (spot - strike) / spot * 100,
             "premium": premium, "static_return_pct": static_return * 100,
             "annualized_pct": annualized, "breakeven": strike - premium,
-            "collateral": strike * 100, "earnings_date": None,
+            "collateral": strike * 100, "earnings_date": None, "last_earnings": None, "is_etf": False,
             "iv_status": None, "iv_rank": None, "iv_pct": None, "iv_n": None,
             "earnings_note": "", "spans_earnings": False, "score": None, "score_parts": {},
             "miss_code": None, "miss_detail": "",
@@ -451,6 +467,7 @@ class ScanResult:
     underlying_rejects: dict[str, str] = field(default_factory=dict)
     underlying_info: dict[str, dict] = field(default_factory=dict)
     earnings_unknown: list[str] = field(default_factory=list)
+    last_earnings: dict[str, dt.date] = field(default_factory=dict)
     errors: list[tuple[str, str]] = field(default_factory=list)
     symbols_total: int = 0
     symbols_scanned: int = 0
@@ -462,6 +479,7 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
     result = ScanResult(symbols_total=len(symbols))
     ocfg, icfg = cfg["option"], cfg["iv"]
     rules = earnings_rules(cfg)
+    etfs = etf_set(cfg)
     all_candidates: list[dict] = []
 
     for symbol in symbols:
@@ -502,21 +520,31 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
 
         # Earnings kuralı (sembol başına tek çağrı)
         next_earnings = None
+        last_earnings = None
         earnings_failed = False
-        try:
-            dates = md.earnings_dates(symbol, today, today + dt.timedelta(days=rules["lookahead"]))
-            upcoming = [d for d in dates if d >= today]
-            next_earnings = min(upcoming) if upcoming else None
-        except MarketDataAuthError:
-            raise
-        except MarketDataError as exc:
-            earnings_failed = True
-            result.errors.append((symbol, f"earnings alınamadı: {exc}"))
-        if next_earnings is None:
-            result.earnings_unknown.append(symbol)
+        is_etf = symbol.upper() in etfs
+        if not is_etf:
+            try:
+                dates = md.earnings_dates(symbol, today - dt.timedelta(days=rules["lookback"]),
+                                          today + dt.timedelta(days=rules["lookahead"]))
+                upcoming = [d for d in dates if d >= today]
+                past = [d for d in dates if d < today]
+                next_earnings = min(upcoming) if upcoming else None
+                last_earnings = max(past) if past else None
+            except MarketDataAuthError:
+                raise
+            except MarketDataError as exc:
+                earnings_failed = True
+                result.errors.append((symbol, f"earnings alınamadı: {exc}"))
+            if next_earnings is None:
+                result.earnings_unknown.append(symbol)
+                if last_earnings:
+                    result.last_earnings[symbol] = last_earnings
         unknown_note = "alınamadı" if earnings_failed else "bilinmiyor"
 
         def earnings_status(cand):
+            if is_etf:
+                return None
             if next_earnings is None:
                 return "earnings_unknown" if rules["unknown"] == "reject" else None
             if (next_earnings - today).days < rules["min_days"]:
@@ -541,8 +569,8 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
                 cand["miss_code"], cand["miss_detail"] = status, earnings_detail(cand, status)
                 result.near_misses.append(cand)
                 continue
-            mark_earnings(cand, next_earnings, unknown_note)
-            if next_earnings is None:
+            mark_earnings(cand, next_earnings, unknown_note, last_earnings, is_etf)
+            if next_earnings is None and not is_etf:
                 result.funnel["warn_earnings_unknown"] += 1
             kept.append(cand)
 
@@ -566,7 +594,7 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
         for cand in near_contracts:
             if earnings_status(cand) or not iv_passes(metrics, icfg):
                 continue
-            mark_earnings(cand, next_earnings, unknown_note)
+            mark_earnings(cand, next_earnings, unknown_note, last_earnings, is_etf)
             apply_iv(cand, metrics)
             result.near_misses.append(cand)
 
@@ -639,7 +667,7 @@ def build_text(result: ScanResult, cfg: dict, today: dt.date) -> str:
              f"{len(result.candidates)} aday | {result.symbols_scanned}/{result.symbols_total} hisse tarandı | "
              f"{result.api_calls} API çağrısı", ""]
     for c in result.candidates:
-        earnings = f"{c['earnings_date']:%d.%m.%y}" if c["earnings_date"] else "-"
+        earnings = "ETF" if c.get("is_etf") else (f"{c['earnings_date']:%d.%m.%y}" if c["earnings_date"] else "-")
         score = f"[{c['score']:>3}] " if c.get("score") is not None else ""
         lines.append(
             f"{score}{c['symbol']:<6} {c['expiry']:%d.%m.%y} ({c['dte']}g) strike {c['strike']:.2f} "
@@ -665,7 +693,9 @@ def build_text(result: ScanResult, cfg: dict, today: dt.date) -> str:
                          f"bid {c['bid']:.2f} delta {c['delta']:.2f} yıllık %{c['annualized_pct']:.1f} "
                          f"-> {c['miss_detail']}")
     if result.earnings_unknown:
-        lines += ["", "Earnings tarihi bulunamayan hisseler: " + ", ".join(sorted(result.earnings_unknown, key=str))]
+        lines += ["", "Earnings tarihi bulunamayan hisseler: " + ", ".join(
+            s_ + (f" (son {result.last_earnings[s_]:%d.%m.%y})" if s_ in result.last_earnings else "")
+            for s_ in sorted(result.earnings_unknown, key=str))]
     grouped = underlying_reject_groups(result)
     if grouped:
         lines += ["", "Hisse filtresinde elenenler:"]
@@ -719,9 +749,9 @@ def _card(title: str, body: str, subtitle: str = "") -> str:
             f'<div style="margin-top:12px">{body}</div></td></tr></table>')
 
 
-def _kpi(label: str, value: str, sub: str = "") -> str:
+def _kpi(label: str, value: str, sub: str = "", pad: str = "0 3px") -> str:
     sub_html = f'<div style="font-size:11px;color:{MUTED};margin-top:2px;line-height:14px">{sub}</div>' if sub else ""
-    return (f'<td width="25%" valign="top" style="padding:0 4px"><div style="background:#ffffff;border:1px solid {LINE};'
+    return (f'<td width="25%" valign="top" style="padding:{pad}"><div style="background:#ffffff;border:1px solid {LINE};'
             f'border-radius:10px;padding:12px 14px"><div style="font-size:10.5px;font-weight:700;color:{MUTED};'
             f'letter-spacing:.7px;text-transform:uppercase">{html.escape(label)}</div>'
             f'<div style="font-size:22px;font-weight:700;color:{INK};margin-top:4px;line-height:26px">{value}</div>'
@@ -769,11 +799,18 @@ def score_legend_html(cfg: dict) -> str:
             "IV geçmişi birikmediyse IV bileşeni çıkarılır, puan düşmez.")
 
 
-def _candidate_row(c: dict, idx: int, min_hist: int) -> str:
+def _candidate_row(c: dict, idx: int, min_hist: int, today: dt.date | None = None) -> str:
     esc = html.escape
     bg = "#ffffff" if idx % 2 == 0 else "#fafbfd"
     earn = f"{c['earnings_date']:%d.%m.%y}" if c["earnings_date"] else "—"
     note = c.get("earnings_note", "")
+    earn_sub = _warn_chip(note) if note else ""
+    if c.get("is_etf"):
+        earn, earn_sub = "", _chip("ETF", "#e8eefc", "#2c4a9a")
+    elif c.get("last_earnings") and not c["earnings_date"]:
+        ago = f" ({(today - c['last_earnings']).days} gün önce)" if today else ""
+        earn_sub += (f'<div style="font-size:10.5px;color:{MUTED};margin-top:3px">'
+                     f'son açıklama {c["last_earnings"]:%d.%m.%y}{ago}</div>')
     if c["iv_status"] == "OK":
         iv_top, iv_sub = f"{c['iv_rank']:.0f} / {c['iv_pct']:.0f}", f"{c['iv_n']} gün"
     elif c["iv_status"] == "BUILDING":
@@ -793,7 +830,7 @@ def _candidate_row(c: dict, idx: int, min_hist: int) -> str:
         _cell(fmt(c["open_interest"], 0), f"hacim {fmt(c['volume'], 0)}"),
         _cell(pill, f"dönem %{c['static_return_pct']:.2f}"),
         _cell(f"${c['collateral']:,.0f}", f"başabaş {c['breakeven']:,.2f}"),
-        _cell(earn, _warn_chip(note) if note else "", "left"),
+        _cell(earn, earn_sub, "left"),
         _cell(iv_top, iv_sub),
     ]
     return f'<tr style="background:{bg}">' + "".join(cells) + "</tr>"
@@ -870,13 +907,13 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
         f'<div style="font-size:38px;font-weight:700;color:#ffffff;line-height:40px">{len(result.candidates)}</div>'
         f'<div style="font-size:11px;letter-spacing:1.2px;color:#8fb3d9;font-weight:700">ADAY</div></td></tr></table>')
     kpis = (
-        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 -4px 14px;'
-        f'width:calc(100% + 8px)"><tr>'
-        + _kpi("Taranan hisse", f"{result.symbols_scanned}<span style='font-size:14px;color:{MUTED}'>/{result.symbols_total}</span>")
-        + _kpi("Değerlendirilen", f"{evaluated}", "hisse filtresini geçti")
-        + _kpi("İncelenen kontrat", f"{result.funnel.get('contracts_total', 0):,}", "put, vade ve delta dahil")
+        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 14px"><tr>'
+        + _kpi("Taranan hisse", f"{result.symbols_scanned}<span style='font-size:14px;color:{MUTED}'>/{result.symbols_total}</span>", "", "0 3px 0 0")
+        + _kpi("Değerlendirilen", f"{evaluated}", "hisse filtresini geçti", "0 3px")
+        + _kpi("İncelenen kontrat", f"{result.funnel.get('contracts_total', 0):,}", "put, vade ve delta dahil", "0 3px")
         + _kpi("Filtreyi geçen", f"{passed:,}",
-               f"mailde en iyi {len(result.candidates)}" if passed > len(result.candidates) else "kontrat")
+               f"mailde en iyi {len(result.candidates)}" if passed > len(result.candidates) else "kontrat",
+               "0 0 0 3px")
         + "</tr></table>")
 
     # ---- adaylar
@@ -884,7 +921,7 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
         head = "".join([_th("Hisse", "left"), _th("Puan", "center"), _th("Vade", "left"), _th("Strike"),
                         _th("Bid / Ask"), _th("Delta / IV"), _th("OI / Hacim"), _th("Yıllık"), _th("Teminat"),
                         _th("Earnings", "left"), _th("IVR / IVP")])
-        rows = "".join(_candidate_row(c, i, min_hist) for i, c in enumerate(result.candidates))
+        rows = "".join(_candidate_row(c, i, min_hist, today) for i, c in enumerate(result.candidates))
         body = (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
                 f'style="border:1px solid {LINE};border-radius:8px;border-collapse:separate;border-spacing:0">'
                 f'<tr>{head}</tr>{rows}</table>')
@@ -897,8 +934,15 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
             legend.append(f"{_chip('⚠ tarih bilinmiyor', '#fff3d6', '#8a5a00')} MarketData sonraki earnings tarihini "
                           "vermedi, kendin doğrula.")
         if result.earnings_unknown:
-            chips = "".join(_chip(s, "#fff3d6", "#8a5a00") for s in sorted(result.earnings_unknown, key=str))
+            chips = "".join(
+                _chip(s + (f" · son {result.last_earnings[s]:%d.%m.%y}" if s in result.last_earnings else ""),
+                      "#fff3d6", "#8a5a00") for s in sorted(result.earnings_unknown, key=str))
             legend.append(f"<b>Earnings tarihi bulunamayan hisseler:</b> {chips}")
+            if result.last_earnings:
+                legend.append("Yakın zamanda açıklama yapmış bir hissenin sonraki açıklaması genelde ~3 ay sonradır; "
+                              "yine de kendin doğrula.")
+        if any(c.get("is_etf") for c in result.candidates):
+            legend.append(f"{_chip('ETF', '#e8eefc', '#2c4a9a')} earnings kuralından muaf; puanda earnings bileşeni yok.")
         if legend:
             body += (f'<div style="margin-top:10px;font-size:11.5px;line-height:20px;color:{MUTED}">'
                      + "<br>".join(legend) + "</div>")
@@ -984,7 +1028,7 @@ def write_outputs(result: ScanResult, cfg: dict, today: dt.date, outdir: Path) -
     cols = ["symbol", "score", "score_return", "score_safety", "score_liquidity", "score_earnings", "score_iv",
             "option_symbol", "spot", "expiry", "dte", "strike", "bid", "ask", "delta", "iv",
             "open_interest", "volume", "spread_pct", "otm_pct", "annualized_pct", "breakeven",
-            "collateral", "earnings_date", "earnings_note", "iv_status", "iv_rank", "iv_pct"]
+            "collateral", "earnings_date", "last_earnings", "is_etf", "earnings_note", "iv_status", "iv_rank", "iv_pct"]
     with open(outdir / "candidates.csv", "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         writer.writeheader()

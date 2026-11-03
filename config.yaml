@@ -69,6 +69,12 @@ universe:
   - "NTSK"
   - "NOW"
 
+# ETF listesi: bu semboller earnings kuralından MUAF (earnings sorgusu yapılmaz, uyarı çıkmaz,
+# puanda earnings bileşeni hesaba katılmaz, raporda "ETF" yazar). Tırnak içinde yaz.
+etf_symbols:
+  - "EWZ"
+  - "SOXL"
+
 # Opsiyon kontratı filtreleri (put, haftalık + aylık vadeler dahil)
 option:
   dte_min: 21              # vadeye en az 21 gün
@@ -99,6 +105,7 @@ earnings:
   expiry_before_earnings: false  # true yaparsan ayrıca vade earnings'ten ÖNCE olmalı
   when_date_unknown: warn      # warn = tarih bulunamazsa uyarıyla listele ; reject = ele
   lookahead_days: 180          # earnings tarihi için bu kadar gün ileriye bakılır
+  lookback_days: 120           # tarihi bilinmeyen hisselerde "son açıklama" için geriye bakış (ek kredi harcamaz)
 
 # Getiri hesabı (spec'te formül "doğrulanmamış" işaretliydi; burada standart formül seçildi)
 return:
@@ -126,6 +133,7 @@ output:
   near_miss_per_reason: 4          # her filtre grubu için mailde en fazla kaç kontrat gösterilsin
   near_miss_max_per_symbol: 2      # bir grupta aynı hisseden en fazla kaç kontrat
   near_miss_delta_tolerance: 0.05  # delta bandının ne kadar dışındakiler "yakın" sayılsın
+  sort_by: score       # score = puana göre sırala ; annualized = yıllık getiriye göre sırala
 
 # MarketData veri modu (pia-shadow'da test edilen ayar)
 marketdata:
@@ -135,3 +143,27 @@ marketdata:
 safety:
   max_api_calls: 400
   skip_when_market_closed: true
+
+# Puan (0-100): her adaya verilen sezgisel sıralama puanı. Ağırlıklı ortalamadır.
+# Ağırlıkları değiştirerek neye önem verdiğini ayarlayabilirsin (0 yaparsan o bileşen devre dışı kalır).
+# IV geçmişi birikmediyse "iv" bileşeni hesaba katılmaz ve kalan ağırlıklar yeniden ölçeklenir.
+score:
+  weights:
+    return: 30      # yıllık getiri
+    safety: 30      # düşük |delta| (daha düşük delta = daha güvenli)
+    liquidity: 20   # dar bid-ask spread + yüksek open interest
+    earnings: 10    # earnings tarihi biliniyor ve vade ondan önce
+    iv: 10          # IV rank (yeterli geçmiş birikince)
+  return_zero_at: 10   # bu yıllık getiride (%) 0 puan
+  return_full_at: 30   # bu yıllık getiri ve üstünde 100 puan
+  delta_zero_at: 0.30  # |delta| bu değerde 0 puan
+  delta_full_at: 0.10  # |delta| bu değer ve altında 100 puan
+  spread_zero_at: 10   # spread (%) bu değerde 0 puan
+  spread_full_at: 1    # spread (%) bu değer ve altında 100 puan
+  oi_zero_at: 300      # open interest bu değerde 0 puan
+  oi_full_at: 3000     # open interest bu değer ve üstünde 100 puan
+  ivr_zero_at: 20      # IV rank bu değerde 0 puan
+  ivr_full_at: 80      # IV rank bu değer ve üstünde 100 puan
+  earnings_known: 100    # earnings tarihi biliniyor ve vade ondan önce
+  earnings_spans: 30     # vade earnings'i kapsıyor
+  earnings_unknown: 40   # earnings tarihi bilinmiyor
