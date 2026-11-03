@@ -244,6 +244,76 @@ def price_out_of_range(last: float, ucfg: dict) -> bool:
     return (lo is not None and last < lo) or (hi is not None and last > hi)
 
 
+# --------------------------------------------------------------------------- puanlama (0-100)
+SCORE_LABELS = {"return": "Getiri", "safety": "Güvenlik", "liquidity": "Likidite", "earnings": "Earnings", "iv": "IV"}
+DEFAULT_SCORE = {
+    "weights": {"return": 30, "safety": 30, "liquidity": 20, "earnings": 10, "iv": 10},
+    "return_zero_at": 10, "return_full_at": 30,     # yıllık getiri %: 10 -> 0 puan, 30 ve üstü -> 100 puan
+    "delta_zero_at": 0.30, "delta_full_at": 0.10,   # |delta|: 0.30 -> 0 puan, 0.10 ve altı -> 100 puan
+    "spread_zero_at": 10, "spread_full_at": 1,      # spread %: 10 -> 0 puan, 1 ve altı -> 100 puan
+    "oi_zero_at": 300, "oi_full_at": 3000,          # open interest
+    "ivr_zero_at": 20, "ivr_full_at": 80,           # IV rank
+    "earnings_known": 100, "earnings_spans": 30, "earnings_unknown": 40,
+}
+
+
+def score_settings(cfg: dict) -> dict:
+    user = cfg.get("score", {}) or {}
+    out = {**DEFAULT_SCORE, **{k: v for k, v in user.items() if k != "weights"}}
+    out["weights"] = {**DEFAULT_SCORE["weights"], **(user.get("weights") or {})}
+    return out
+
+
+def _lin(x: float, zero_at: float, full_at: float) -> float:
+    """zero_at -> 0, full_at -> 100, arası doğrusal; dışı kırpılır. (zero_at > full_at ise ters ölçek)"""
+    if full_at == zero_at:
+        return 100.0 if x >= full_at else 0.0
+    t = (x - zero_at) / (full_at - zero_at)
+    return max(0.0, min(1.0, t)) * 100.0
+
+
+def score_candidate(c: dict, cfg: dict) -> tuple[int | None, dict]:
+    """Adayın 0-100 puanı ve bileşenleri. Hesaplanamayan bileşen (ör. IV geçmişi yok) çıkarılır,
+    kalan ağırlıklar yeniden ölçeklenir; yani eksik veri puanı düşürmez."""
+    s = score_settings(cfg)
+    parts: dict[str, float | None] = {
+        "return": _lin(c["annualized_pct"], s["return_zero_at"], s["return_full_at"]),
+        "safety": _lin(abs(c["delta"]), s["delta_zero_at"], s["delta_full_at"]),
+    }
+    oi = c.get("open_interest")
+    liq = [_lin(c["spread_pct"], s["spread_zero_at"], s["spread_full_at"])]
+    if oi is not None:
+        liq.append(_lin(oi, s["oi_zero_at"], s["oi_full_at"]))
+    parts["liquidity"] = sum(liq) / len(liq)
+    if c.get("earnings_date") is None:
+        parts["earnings"] = float(s["earnings_unknown"])
+    elif c.get("spans_earnings"):
+        parts["earnings"] = float(s["earnings_spans"])
+    else:
+        parts["earnings"] = float(s["earnings_known"])
+    parts["iv"] = _lin(c["iv_rank"], s["ivr_zero_at"], s["ivr_full_at"]) if c.get("iv_status") == "OK" else None
+
+    num_, den = 0.0, 0.0
+    for key, value in parts.items():
+        weight = float(s["weights"].get(key, 0) or 0)
+        if value is None or weight <= 0:
+            continue
+        num_ += weight * value
+        den += weight
+    if den == 0:
+        return None, {}
+    return round(num_ / den), {k: round(v) for k, v in parts.items() if v is not None}
+
+
+def score_note_text(cfg: dict) -> str:
+    w = score_settings(cfg)["weights"]
+    parts = " · ".join(f"{label} {w[key]:g}" for key, label in SCORE_LABELS.items() if w.get(key))
+    return ("Puan (0-100) ağırlıklı ortalamadır: " + parts + ". Getiri: yıllık getiri; Güvenlik: düşük |delta|; "
+            "Likidite: dar spread + yüksek OI; Earnings: tarih biliniyor ve vade öncesi; IV: IV rank "
+            "(geçmiş birikmediyse bileşen çıkarılır, puan düşmez). Sezgisel bir sıralama yardımcısıdır, "
+            "getiri ya da güvenlik garantisi değildir.")
+
+
 # --------------------------------------------------------------------------- filtreler
 def check_underlying(quote: dict | None, ucfg: dict) -> tuple[dict, str | None]:
     info = {"last": None, "volume": None, "change_pct": None}
@@ -351,7 +421,7 @@ def evaluate_contracts(rows: list[dict], symbol: str, spot: float, today: dt.dat
             "annualized_pct": annualized, "breakeven": strike - premium,
             "collateral": strike * 100, "earnings_date": None,
             "iv_status": None, "iv_rank": None, "iv_pct": None, "iv_n": None,
-            "earnings_note": "", "spans_earnings": False,
+            "earnings_note": "", "spans_earnings": False, "score": None, "score_parts": {},
             "miss_code": None, "miss_detail": "",
         }
         if not fails:
@@ -501,7 +571,13 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
             result.near_misses.append(cand)
 
     # Sırala: yıllık getiri; hisse başına sınır; ilk N
-    all_candidates.sort(key=lambda c: (-c["annualized_pct"], c["spread_pct"]))
+    for cand in all_candidates:
+        cand["score"], cand["score_parts"] = score_candidate(cand, cfg)
+    if (cfg.get("output", {}) or {}).get("sort_by", "score") == "annualized":
+        all_candidates.sort(key=lambda c: (-c["annualized_pct"], c["spread_pct"]))
+    else:
+        all_candidates.sort(key=lambda c: (-(c["score"] if c["score"] is not None else -1),
+                                           -c["annualized_pct"], c["symbol"]))
     per_symbol: Counter = Counter()
     selected = []
     for cand in all_candidates:
@@ -564,8 +640,9 @@ def build_text(result: ScanResult, cfg: dict, today: dt.date) -> str:
              f"{result.api_calls} API çağrısı", ""]
     for c in result.candidates:
         earnings = f"{c['earnings_date']:%d.%m.%y}" if c["earnings_date"] else "-"
+        score = f"[{c['score']:>3}] " if c.get("score") is not None else ""
         lines.append(
-            f"{c['symbol']:<6} {c['expiry']:%d.%m.%y} ({c['dte']}g) strike {c['strike']:.2f} "
+            f"{score}{c['symbol']:<6} {c['expiry']:%d.%m.%y} ({c['dte']}g) strike {c['strike']:.2f} "
             f"bid {c['bid']:.2f} delta {c['delta']:.2f} yıllık %{c['annualized_pct']:.1f} "
             f"OTM %{c['otm_pct']:.1f} teminat ${c['collateral']:,.0f} "
             f"IVR/IVP {iv_text(c)} earnings {earnings}"
@@ -659,6 +736,39 @@ def _warn_chip(note: str) -> str:
     return _chip("⚠ tarih bilinmiyor", "#fff3d6", "#8a5a00", note)
 
 
+def _score_colors(score: int) -> tuple[str, str, str]:
+    """(rozet zemini, yazı rengi, çubuk rengi)"""
+    if score >= 70:
+        return "#1f9d57", "#ffffff", "#1f9d57"
+    if score >= 55:
+        return "#cdeedb", "#11693f", "#5cbf86"
+    if score >= 40:
+        return "#fdefc3", "#7a5a00", "#e3b53d"
+    return "#f9d5d5", "#9a2222", "#e07a7a"
+
+
+def _score_cell(c: dict) -> str:
+    score = c.get("score")
+    if score is None:
+        return _cell("—", "", "center")
+    bg, fg, bar = _score_colors(score)
+    tip = " · ".join(f"{SCORE_LABELS[k]} {v}" for k, v in (c.get("score_parts") or {}).items() if k in SCORE_LABELS)
+    chip = (f'<span title="{html.escape(tip, quote=True)}" style="display:inline-block;min-width:36px;padding:3px 8px;'
+            f'border-radius:7px;background:{bg};color:{fg};font-weight:700;font-size:14px;text-align:center">{score}</span>')
+    meter = (f'<div style="height:3px;border-radius:2px;background:#e8edf2;width:44px;margin:5px auto 0">'
+             f'<div style="height:3px;border-radius:2px;background:{bar};width:{score}%"></div></div>')
+    return _cell(chip, meter, "center")
+
+
+def score_legend_html(cfg: dict) -> str:
+    w = score_settings(cfg)["weights"]
+    chips = "".join(_chip(label, *_score_colors(sample)[:2]) for label, sample in
+                    (("70–100", 80), ("55–69", 60), ("40–54", 45), ("0–39", 20)))
+    parts = " · ".join(f"{label} {w[key]:g}" for key, label in SCORE_LABELS.items() if w.get(key))
+    return (f"<b>Puan (0–100):</b> {chips} ağırlıklı ortalama: {html.escape(parts)}. "
+            "IV geçmişi birikmediyse IV bileşeni çıkarılır, puan düşmez.")
+
+
 def _candidate_row(c: dict, idx: int, min_hist: int) -> str:
     esc = html.escape
     bg = "#ffffff" if idx % 2 == 0 else "#fafbfd"
@@ -675,6 +785,7 @@ def _candidate_row(c: dict, idx: int, min_hist: int) -> str:
             f'font-weight:700;font-size:13px">%{c["annualized_pct"]:.1f}</span>')
     cells = [
         _cell(f'<b style="font-size:14px">{esc(c["symbol"])}</b>', f"${c['spot']:,.2f}", "left"),
+        _score_cell(c),
         _cell(f"{c['expiry']:%d.%m.%y}", f"{c['dte']} gün", "left"),
         _cell(f"<b>{c['strike']:,.2f}</b>", f"OTM %{c['otm_pct']:.1f}"),
         _cell(f"{c['bid']:.2f} / {c['ask']:.2f}", f"spread %{c['spread_pct']:.1f}"),
@@ -770,14 +881,16 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
 
     # ---- adaylar
     if result.candidates:
-        head = "".join([_th("Hisse", "left"), _th("Vade", "left"), _th("Strike"), _th("Bid / Ask"),
-                        _th("Delta / IV"), _th("OI / Hacim"), _th("Yıllık"), _th("Teminat"),
+        head = "".join([_th("Hisse", "left"), _th("Puan", "center"), _th("Vade", "left"), _th("Strike"),
+                        _th("Bid / Ask"), _th("Delta / IV"), _th("OI / Hacim"), _th("Yıllık"), _th("Teminat"),
                         _th("Earnings", "left"), _th("IVR / IVP")])
         rows = "".join(_candidate_row(c, i, min_hist) for i, c in enumerate(result.candidates))
         body = (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
                 f'style="border:1px solid {LINE};border-radius:8px;border-collapse:separate;border-spacing:0">'
                 f'<tr>{head}</tr>{rows}</table>')
         legend = []
+        if any(c.get("score") is not None for c in result.candidates):
+            legend.append(score_legend_html(cfg))
         if warn_rows:
             legend.append(f"{_chip('⚠ vade kapsıyor', '#fff3d6', '#8a5a00')} opsiyonun vadesi earnings tarihinden sonra, "
                           "pozisyon açıklamayı açık taşır.")
@@ -789,8 +902,10 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
         if legend:
             body += (f'<div style="margin-top:10px;font-size:11.5px;line-height:20px;color:{MUTED}">'
                      + "<br>".join(legend) + "</div>")
-        cards = _card("Adaylar", body, "Yıllık getiriye göre sıralı. Yıllık = bid / strike × 365 / DTE · "
-                                       "Teminat = strike × 100 · Başabaş = strike − bid")
+        order = ("Yıllık getiriye göre sıralı." if (cfg.get("output", {}) or {}).get("sort_by", "score") == "annualized"
+                 else "Puana göre sıralı.")
+        cards = _card("Adaylar", body, order + " Yıllık = bid / strike × 365 / DTE · "
+                                              "Teminat = strike × 100 · Başabaş = strike − bid")
     else:
         cards = _card("Adaylar",
                       f'<div style="background:#f6f8fb;border:1px dashed #c3cfdb;border-radius:8px;padding:16px;'
@@ -836,6 +951,7 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
     notes = [
         "Veri: MarketData cached modu (en fazla ~20 dk gecikmeli olabilir). Emir vermeden önce güncel fiyatı broker'ında kontrol et.",
         earnings_note_text(cfg),
+        score_note_text(cfg),
         f"IVR/IVP: kendi biriktirdiğimiz IV geçmişinden hesaplanır (en az {icfg['min_history_days']} gün gerekir). "
         "'birikiyor' yazıyorsa filtre henüz uygulanmıyor.",
         "Yakın kaçan = yalnızca tek bir filtreye takılan kontrat. Hisse filtresi yüzünden elenenlerde earnings/IV kontrol edilmez.",
@@ -865,13 +981,15 @@ def write_outputs(result: ScanResult, cfg: dict, today: dt.date, outdir: Path) -
     outdir.mkdir(parents=True, exist_ok=True)
     (outdir / "report.html").write_text(build_html(result, cfg, today), encoding="utf-8")
     (outdir / "report.txt").write_text(build_text(result, cfg, today), encoding="utf-8")
-    cols = ["symbol", "option_symbol", "spot", "expiry", "dte", "strike", "bid", "ask", "delta", "iv",
+    cols = ["symbol", "score", "score_return", "score_safety", "score_liquidity", "score_earnings", "score_iv",
+            "option_symbol", "spot", "expiry", "dte", "strike", "bid", "ask", "delta", "iv",
             "open_interest", "volume", "spread_pct", "otm_pct", "annualized_pct", "breakeven",
             "collateral", "earnings_date", "earnings_note", "iv_status", "iv_rank", "iv_pct"]
     with open(outdir / "candidates.csv", "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(result.candidates)
+        for c in result.candidates:
+            writer.writerow({**c, **{"score_" + k: v for k, v in (c.get("score_parts") or {}).items()}})
     with open(outdir / "near_misses.csv", "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=cols + ["miss_code", "miss_detail"], extrasaction="ignore")
         writer.writeheader()
