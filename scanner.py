@@ -55,15 +55,16 @@ FUNNEL_LABELS = [
     ("rej_bid", "Bid yetersiz"),
     ("rej_spread", "Bid-ask spread geniş"),
     ("rej_return", "Yıllık getiri düşük"),
-    ("rej_earnings", "Vade, earnings tarihinden önce değil"),
-    ("rej_earnings_unknown", "Earnings tarihi bilinmiyor"),
+    ("rej_earnings", "Earnings kuralına takılan"),
+    ("rej_earnings_unknown", "Earnings tarihi bilinmiyor (elendi)"),
     ("rej_iv", "IV rank / percentile yetersiz"),
+    ("warn_earnings_unknown", "Earnings tarihi bilinmiyor (uyarıyla listeye alındı)"),
     ("passed", "TÜM FİLTRELERİ GEÇEN"),
 ]
 
 # Yakın kaçan gruplarının başlıkları (gösterim sırası bu listedir)
 NEAR_LABELS = [
-    ("earnings", "Sadece earnings kuralına takılanlar (vade earnings tarihinden önce değil)"),
+    ("earnings", "Sadece earnings kuralına takılanlar"),
     ("earnings_unknown", "Sadece earnings tarihi bulunamadığı için elenenler"),
     ("iv", "Sadece IV rank / percentile'a takılanlar"),
     ("oi", "Sadece open interest düşük olanlar"),
@@ -192,6 +193,57 @@ def apply_iv(cand: dict, metrics: dict) -> None:
         cand["iv_rank"], cand["iv_pct"] = metrics["rank"], metrics["pct"]
 
 
+# --------------------------------------------------------------------------- earnings kuralları
+def earnings_rules(cfg: dict) -> dict:
+    """Earnings ayarları. Eski config.yaml'da yeni anahtarlar yoksa varsayılanlar geçerli olur."""
+    e = cfg.get("earnings", {}) or {}
+    return {
+        "min_days": e.get("min_days_to_earnings", 30),          # tarama tarihi ile earnings arası en az bu kadar gün
+        "expiry_before": e.get("expiry_before_earnings", False),  # True: vade de earnings'ten önce olmalı
+        "unknown": e.get("when_date_unknown", "warn"),            # warn = uyarıyla listele, reject = ele
+        "lookahead": e.get("lookahead_days", 180),
+    }
+
+
+def mark_earnings(cand: dict, next_earnings: dt.date | None, unknown_note: str) -> None:
+    cand["earnings_date"] = next_earnings
+    cand["spans_earnings"] = bool(next_earnings and cand["expiry"] >= next_earnings)
+    if next_earnings is None:
+        cand["earnings_note"] = f"earnings {unknown_note}"
+    elif cand["spans_earnings"]:
+        cand["earnings_note"] = "vade earnings'i kapsıyor"
+    else:
+        cand["earnings_note"] = ""
+
+
+def earnings_note_text(cfg: dict) -> str:
+    r = earnings_rules(cfg)
+    text = f"Earnings: tarama tarihi ile sonraki earnings arası en az {r['min_days']} gün olmalı."
+    if r["expiry_before"]:
+        text += " Ayrıca vade earnings tarihinden önce olmalı."
+    else:
+        text += " Vade earnings'i kapsayabilir; böyle satırlar 'vade earnings'i kapsıyor' diye işaretlenir."
+    text += (" Tarihi bulunamayan hisseler 'earnings bilinmiyor' uyarısıyla listelenir."
+             if r["unknown"] == "warn" else " Tarihi bulunamayan hisseler elenir.")
+    return text
+
+
+def missing_breakdown(result) -> str:
+    labels = [("missing_vade", "vade yok"), ("missing_strike", "strike yok"), ("missing_delta", "delta yok"),
+              ("missing_bid", "bid yok"), ("missing_ask", "ask yok/0")]
+    parts = [f"{label} {result.funnel[key]}" for key, label in labels if result.funnel.get(key)]
+    return ", ".join(parts)
+
+
+def price_out_of_range(last: float, ucfg: dict) -> bool:
+    """Hisse fiyat sınırı varsayılan olarak KAPALI (liste senin kontrolünde).
+    Açmak için config.yaml: underlying.use_price_limits: true"""
+    if not ucfg.get("use_price_limits", False):
+        return False
+    lo, hi = ucfg.get("price_min"), ucfg.get("price_max")
+    return (lo is not None and last < lo) or (hi is not None and last > hi)
+
+
 # --------------------------------------------------------------------------- filtreler
 def check_underlying(quote: dict | None, ucfg: dict) -> tuple[dict, str | None]:
     info = {"last": None, "volume": None, "change_pct": None}
@@ -203,7 +255,7 @@ def check_underlying(quote: dict | None, ucfg: dict) -> tuple[dict, str | None]:
         info["change_pct"] = change / (last - change) * 100
     if last is None:
         return info, "no_quote"
-    if not (ucfg["price_min"] <= last <= ucfg["price_max"]):
+    if price_out_of_range(last, ucfg):
         return info, "price_range"
     if volume is None or not volume > ucfg["volume_gt"]:
         return info, "underlying_volume"
@@ -240,8 +292,21 @@ def evaluate_contracts(rows: list[dict], symbol: str, spot: float, today: dt.dat
         exp = to_date(row.get("expiration"), NY)
         strike, delta = num(row.get("strike")), num(row.get("delta"))
         bid, ask = num(row.get("bid")), num(row.get("ask"))
-        if exp is None or strike is None or strike <= 0 or delta is None or bid is None or ask is None or ask <= 0:
+        missing = []
+        if exp is None:
+            missing.append("vade")
+        if strike is None or strike <= 0:
+            missing.append("strike")
+        if delta is None:
+            missing.append("delta")
+        if bid is None:
+            missing.append("bid")
+        if ask is None or ask <= 0:
+            missing.append("ask")
+        if missing:
             funnel["rej_missing"] += 1
+            for name in missing:   # bir kontrat birden fazla alanda eksik olabilir
+                funnel["missing_" + name] += 1
             continue
         if str(row.get("side", "put")).lower() != "put":
             funnel["rej_missing"] += 1
@@ -286,6 +351,7 @@ def evaluate_contracts(rows: list[dict], symbol: str, spot: float, today: dt.dat
             "annualized_pct": annualized, "breakeven": strike - premium,
             "collateral": strike * 100, "earnings_date": None,
             "iv_status": None, "iv_rank": None, "iv_pct": None, "iv_n": None,
+            "earnings_note": "", "spans_earnings": False,
             "miss_code": None, "miss_detail": "",
         }
         if not fails:
@@ -324,7 +390,8 @@ class ScanResult:
 
 def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[str]) -> ScanResult:
     result = ScanResult(symbols_total=len(symbols))
-    ocfg, icfg, ecfg = cfg["option"], cfg["iv"], cfg["earnings"]
+    ocfg, icfg = cfg["option"], cfg["iv"]
+    rules = earnings_rules(cfg)
     all_candidates: list[dict] = []
 
     for symbol in symbols:
@@ -367,7 +434,7 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
         next_earnings = None
         earnings_failed = False
         try:
-            dates = md.earnings_dates(symbol, today, today + dt.timedelta(days=ecfg["lookahead_days"]))
+            dates = md.earnings_dates(symbol, today, today + dt.timedelta(days=rules["lookahead"]))
             upcoming = [d for d in dates if d >= today]
             next_earnings = min(upcoming) if upcoming else None
         except MarketDataAuthError:
@@ -377,14 +444,22 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
             result.errors.append((symbol, f"earnings alınamadı: {exc}"))
         if next_earnings is None:
             result.earnings_unknown.append(symbol)
+        unknown_note = "alınamadı" if earnings_failed else "bilinmiyor"
 
         def earnings_status(cand):
             if next_earnings is None:
-                return "earnings_unknown" if (ecfg["require_known_date"] or earnings_failed) else None
-            return "earnings" if cand["expiry"] >= next_earnings else None
+                return "earnings_unknown" if rules["unknown"] == "reject" else None
+            if (next_earnings - today).days < rules["min_days"]:
+                return "earnings"
+            if rules["expiry_before"] and cand["expiry"] >= next_earnings:
+                return "earnings"
+            return None
 
         def earnings_detail(cand, status):
             if status == "earnings":
+                days = (next_earnings - today).days
+                if days < rules["min_days"]:
+                    return f"earnings {next_earnings:%d.%m.%y} ({days} gün sonra) < {rules['min_days']} gün"
                 return f"vade {cand['expiry']:%d.%m.%y} ≥ earnings {next_earnings:%d.%m.%y}"
             return "earnings tarihi bulunamadı"
 
@@ -396,7 +471,9 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
                 cand["miss_code"], cand["miss_detail"] = status, earnings_detail(cand, status)
                 result.near_misses.append(cand)
                 continue
-            cand["earnings_date"] = next_earnings
+            mark_earnings(cand, next_earnings, unknown_note)
+            if next_earnings is None:
+                result.funnel["warn_earnings_unknown"] += 1
             kept.append(cand)
 
         # IV rank / percentile kuralı
@@ -419,7 +496,7 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
         for cand in near_contracts:
             if earnings_status(cand) or not iv_passes(metrics, icfg):
                 continue
-            cand["earnings_date"] = next_earnings
+            mark_earnings(cand, next_earnings, unknown_note)
             apply_iv(cand, metrics)
             result.near_misses.append(cand)
 
@@ -491,10 +568,14 @@ def build_text(result: ScanResult, cfg: dict, today: dt.date) -> str:
             f"{c['symbol']:<6} {c['expiry']:%d.%m.%y} ({c['dte']}g) strike {c['strike']:.2f} "
             f"bid {c['bid']:.2f} delta {c['delta']:.2f} yıllık %{c['annualized_pct']:.1f} "
             f"OTM %{c['otm_pct']:.1f} teminat ${c['collateral']:,.0f} "
-            f"IVR/IVP {iv_text(c)} earnings {earnings}")
+            f"IVR/IVP {iv_text(c)} earnings {earnings}"
+            + (f" !! {c['earnings_note']}" if c.get("earnings_note") else ""))
     lines += ["", "Filtre özeti:"]
     for key, label in FUNNEL_LABELS:
         lines.append(f"  {label}: {result.funnel.get(key, 0)}")
+    detail = missing_breakdown(result)
+    if detail:
+        lines.append(f"  (Eksik veri dökümü, bir kontrat birden fazla alanda eksik olabilir: {detail})")
 
     groups = group_near_misses(result, cfg)
     lines += ["", "Yakın kaçanlar (yalnızca tek bir filtreye takılanlar):"]
@@ -524,7 +605,7 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
     th2 = th.replace("#1f3a5f", "#5b6b7f")
     td = "padding:5px 8px;text-align:right;border-bottom:1px solid #e3e6ea;white-space:nowrap"
     head = ["Hisse", "Fiyat", "Vade", "DTE", "Strike", "OTM%", "Bid", "Ask", "Spread%", "Delta", "IV",
-            "IVR / IVP", "OI", "Hacim", "Yıllık%", "Başabaş", "Teminat", "Earnings"]
+            "IVR / IVP", "OI", "Hacim", "Yıllık%", "Başabaş", "Teminat", "Earnings", "Uyarı"]
     parts = [
         "<div style=\"font-family:Arial,Helvetica,sans-serif;color:#222;font-size:13px\">",
         f"<h2 style=\"margin:0 0 4px\">CSP Scanner — {today:%d.%m.%Y}</h2>",
@@ -544,6 +625,8 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
                 fmt(c["iv"] * 100 if c["iv"] is not None else None, 0, "%"),
                 esc(iv_text(c)), fmt(c["open_interest"], 0), fmt(c["volume"], 0),
                 f"<b>{c['annualized_pct']:.1f}</b>", fmt(c["breakeven"]), f"${c['collateral']:,.0f}", earnings,
+                (f"<span style=\"color:#b45309;font-weight:600\">⚠ {esc(c['earnings_note'])}</span>"
+                 if c.get("earnings_note") else ""),
             ]
             parts.append("<tr>" + "".join(f"<td style=\"{td}\">{v}</td>" for v in cells) + "</tr>")
         parts.append("</table>")
@@ -580,6 +663,10 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
         parts.append(f"<tr><td style=\"padding:3px 12px 3px 0;{weight}\">{esc(label)}</td>"
                      f"<td style=\"padding:3px 0;text-align:right;{weight}\">{result.funnel.get(key, 0)}</td></tr>")
     parts.append("</table>")
+    detail = missing_breakdown(result)
+    if detail:
+        parts.append(f"<p style=\"margin:6px 0 0;color:#555;font-size:12px\">Eksik veri dökümü "
+                     f"(bir kontrat birden fazla alanda eksik olabilir): {esc(detail)}</p>")
 
     grouped = underlying_reject_groups(result)
     if grouped:
@@ -596,7 +683,7 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
     notes = [
         "Veri: MarketData cached modu (en fazla ~20 dk gecikmeli olabilir). Emir vermeden önce güncel fiyatı broker'ında kontrol et.",
         "Yıllık getiri = bid / strike × 365 / DTE. Teminat = strike × 100. Başabaş = strike − bid.",
-        "Earnings: sonraki tarih biliniyor ve vade bu tarihten kesinlikle önce olmalı.",
+        earnings_note_text(cfg),
         f"IVR/IVP: kendi biriktirdiğimiz IV geçmişinden hesaplanır (en az {icfg['min_history_days']} gün gerekir). "
         "'birikiyor (n)' yazıyorsa filtre henüz uygulanmıyor, değer birikme aşamasında.",
         "Yakın kaçan = yalnızca tek bir filtreye takılan kontrat. Hisse filtresi yüzünden elenenlerde earnings/IV kontrol edilmez.",
@@ -615,7 +702,7 @@ def write_outputs(result: ScanResult, cfg: dict, today: dt.date, outdir: Path) -
     (outdir / "report.txt").write_text(build_text(result, cfg, today), encoding="utf-8")
     cols = ["symbol", "option_symbol", "spot", "expiry", "dte", "strike", "bid", "ask", "delta", "iv",
             "open_interest", "volume", "spread_pct", "otm_pct", "annualized_pct", "breakeven",
-            "collateral", "earnings_date", "iv_status", "iv_rank", "iv_pct"]
+            "collateral", "earnings_date", "earnings_note", "iv_status", "iv_rank", "iv_pct"]
     with open(outdir / "candidates.csv", "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         writer.writeheader()

@@ -2,49 +2,72 @@
 # Kriterlerin kaynağı: pia-shadow reposundaki CSP2_SPEC_V1 (Barchart ayarların).
 # Bir değeri değiştirmek için sadece sayıyı düzenle; kodu değiştirmene gerek yok.
 
-# Taranacak hisseler (pia-shadow live-config.json içindeki ilk 40 sembol).
-# Hisse eklemek/çıkarmak için listeyi düzenle. Her hisse günde yaklaşık 2-3 API kredisi harcar.
+# Taranacak hisseler (senin takip listen). Hisse eklemek/çıkarmak için listeyi düzenle.
+# Her hisse günde yaklaşık 2-3 API kredisi harcar. Semboller tırnak içinde yazılır (ON, NO gibi
+# semboller tırnaksız yazılırsa YAML bunları 'doğru/yanlış' sanır).
 universe:
-  - AAPL
-  - MSFT
-  - AMZN
-  - GOOGL
-  - META
-  - NVDA
-  - AMD
-  - INTC
-  - QCOM
-  - AVGO
-  - MU
-  - TXN
-  - AMAT
-  - LRCX
-  - KLAC
-  - ADI
-  - NXPI
-  - "ON"
-  - MRVL
-  - ARM
-  - CRWD
-  - NOW
-  - ANET
-  - ADBE
-  - CRM
-  - ORCL
-  - CSCO
-  - IBM
-  - HPQ
-  - DELL
-  - PLTR
-  - PANW
-  - FTNT
-  - NET
-  - DDOG
-  - SNOW
-  - SHOP
-  - UBER
-  - ABNB
-  - PYPL
+  - "AAPL"
+  - "AMD"
+  - "AMZN"
+  - "APLD"
+  - "ARM"
+  - "ASML"
+  - "AVGO"
+  - "CME"
+  - "CRDO"
+  - "CRWD"
+  - "CRWV"
+  - "DAVE"
+  - "DDOG"
+  - "DIS"
+  - "ERO"
+  - "EWZ"
+  - "FIX"
+  - "FTNT"
+  - "GLW"
+  - "GOOGL"
+  - "HCA"
+  - "HIMS"
+  - "INOD"
+  - "INTC"
+  - "ISRG"
+  - "KMI"
+  - "LITE"
+  - "LRCX"
+  - "MA"
+  - "META"
+  - "MRVL"
+  - "MSFT"
+  - "MU"
+  - "NBIS"
+  - "NFLX"
+  - "NVDA"
+  - "NVT"
+  - "ONTO"
+  - "ORCL"
+  - "PANW"
+  - "PLTR"
+  - "RKLB"
+  - "SHOP"
+  - "SKHY"
+  - "SNDK"
+  - "SOFI"
+  - "SOXL"
+  - "SPCX"
+  - "SPGI"
+  - "TMO"
+  - "TSLA"
+  - "TSM"
+  - "UNH"
+  - "VRT"
+  - "WCN"
+  - "LLY"
+  - "BE"
+  - "ZS"
+  - "OKTA"
+  - "S"
+  - "NTSK"
+  - "NOW"
 
 # Opsiyon kontratı filtreleri (put, haftalık + aylık vadeler dahil)
 option:
@@ -59,18 +82,22 @@ option:
 
 # Hisse (underlying) filtreleri
 underlying:
+  # Hisse fiyat sınırı KAPALI (taranacak listeyi sen belirliyorsun). Açmak istersen
+  # use_price_limits: true yap; price_min / price_max değerleri o zaman geçerli olur.
+  use_price_limits: false
   price_min: 20
   price_max: 300
   volume_gt: 1000000       # günlük hisse hacmi > 1 milyon (gün içi çalışırsa o ana kadarki hacim)
   daily_change_pct_min: -3 # günlük değişim -%3 ile +%3 arasında
   daily_change_pct_max: 3
   # market_cap_min (5 milyar $): MarketData bu bilgiyi vermiyor, bu yüzden uygulanmıyor.
-  # Evren zaten önceden seçilmiş büyük şirketlerden oluşuyor.
 
-# Earnings kuralı: bir sonraki earnings tarihi biliniyor olmalı ve vade ondan kesinlikle önce olmalı
+# Earnings kuralı
 earnings:
-  require_known_date: true   # tarih bulunamazsa aday elenir (false yaparsan geçer)
-  lookahead_days: 120        # earnings tarihi için bu kadar gün ileriye bakılır
+  min_days_to_earnings: 30     # tarama tarihi ile sonraki earnings arası en az 30 gün
+  expiry_before_earnings: false  # true yaparsan ayrıca vade earnings'ten ÖNCE olmalı
+  when_date_unknown: warn      # warn = tarih bulunamazsa uyarıyla listele ; reject = ele
+  lookahead_days: 180          # earnings tarihi için bu kadar gün ileriye bakılır
 
 # Getiri hesabı (spec'te formül "doğrulanmamış" işaretliydi; burada standart formül seçildi)
 return:
@@ -94,6 +121,10 @@ iv:
 output:
   top_n: 25            # mailde en fazla kaç aday
   max_per_symbol: 2    # aynı hisseden en fazla kaç kontrat
+  # "Yakın kaçanlar" bölümü (yalnızca tek bir filtreye takılan kontratlar)
+  near_miss_per_reason: 4          # her filtre grubu için mailde en fazla kaç kontrat gösterilsin
+  near_miss_max_per_symbol: 2      # bir grupta aynı hisseden en fazla kaç kontrat
+  near_miss_delta_tolerance: 0.05  # delta bandının ne kadar dışındakiler "yakın" sayılsın
 
 # MarketData veri modu (pia-shadow'da test edilen ayar)
 marketdata:
