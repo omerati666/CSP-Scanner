@@ -5,7 +5,7 @@ on:
     # Hafta içi her gün 19:00 UTC = Türkiye saati 22:00 (ABD piyasası kapanışına ~2 saat var)
     # ABD yaz saatinde (Mart-Kasım) bu saat piyasa kapanışına ~1 saat kala olur.
     # Saati değiştirmek için ilk sayı = dakika, ikinci sayı = UTC saat.
-    - cron: "0 19 * * 1-5"
+    - cron: "50 18 * * 1-5"
   workflow_dispatch:
     inputs:
       symbols:
