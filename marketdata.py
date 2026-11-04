@@ -42,19 +42,19 @@ class MarketData:
     # ------------------------------------------------------------------ düşük seviye
     def _get(self, path: str, params: dict | None = None) -> dict | None:
         url = BASE_URL + path
-        last_err = "bilinmeyen hata"
+        last_err = "unknown error"
         for attempt in range(4):
             if self.calls >= self.max_calls:
-                raise MarketDataError("API çağrı limiti (safety.max_api_calls) aşıldı")
+                raise MarketDataError("API call limit (safety.max_api_calls) exceeded")
             self.calls += 1
             try:
                 resp = self.session.get(url, params=params, headers=self.headers, timeout=self.timeout)
             except requests.RequestException as exc:
-                last_err = f"bağlantı hatası: {exc.__class__.__name__}"
+                last_err = f"connection error: {exc.__class__.__name__}"
                 self._sleep(2 ** attempt)
                 continue
             if resp.status_code in (401, 403):
-                raise MarketDataAuthError(f"HTTP {resp.status_code}: token geçersiz ya da yetkisiz")
+                raise MarketDataAuthError(f"HTTP {resp.status_code}: token invalid or unauthorized")
             if resp.status_code == 429 or resp.status_code >= 500:
                 last_err = f"HTTP {resp.status_code}"
                 retry_after = resp.headers.get("Retry-After", "")
@@ -63,18 +63,18 @@ class MarketData:
             try:
                 body = resp.json()
             except ValueError:
-                raise MarketDataError(f"HTTP {resp.status_code}: JSON olmayan cevap")
+                raise MarketDataError(f"HTTP {resp.status_code}: non-JSON response")
             if resp.status_code in (200, 203):  # 203 = cached veri
                 status = body.get("s")
                 if status == "no_data":
                     return None
                 if status == "error":
-                    raise MarketDataError(str(body.get("errmsg", "API hatası")))
+                    raise MarketDataError(str(body.get("errmsg", "API error")))
                 return body
             if resp.status_code == 404 and body.get("s") == "no_data":
                 return None
             raise MarketDataError(f"HTTP {resp.status_code}: {body.get('errmsg', '')}")
-        raise MarketDataError(f"Tekrar denemeler başarısız ({last_err})")
+        raise MarketDataError(f"Retries failed ({last_err})")
 
     # ------------------------------------------------------------------ uçlar
     def quote(self, symbol: str) -> dict | None:

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Günlük Cash Secured Put (CSP) tarayıcısı.
+"""Daily Cash Secured Put (CSP) scanner.
 
-Kullanım:
-    python scanner.py                      # tara + mail at
-    python scanner.py --no-mail            # sadece tara, out/ klasörüne yaz
-    python scanner.py --symbols AAPL,MSFT  # sadece bu hisseleri tara (test)
+Usage:
+    python scanner.py                      # scan + send mail
+    python scanner.py --no-mail            # scan only, write to out/
+    python scanner.py --symbols AAPL,MSFT  # scan only these symbols (test)
 
-Gerekli ortam değişkenleri:
+Required environment variables:
     MARKETDATA_TOKEN, GMAIL_USER, GMAIL_APP_PASSWORD, MAIL_TO
 """
 from __future__ import annotations
@@ -32,10 +32,10 @@ NY = ZoneInfo("America/New_York")
 ROOT = Path(__file__).resolve().parent
 
 UNDERLYING_LABELS = {
-    "no_quote": "Fiyat verisi alınamadı",
-    "price_range": "Fiyat aralığı dışında",
-    "underlying_volume": "Hisse hacmi düşük",
-    "daily_change": "Günlük değişim sınır dışında",
+    "no_quote": "No quote data",
+    "price_range": "Price out of range",
+    "underlying_volume": "Stock volume too low",
+    "daily_change": "Daily change out of range",
 }
 
 # Hisse filtresi kodu -> "yakın kaçan" kodu
@@ -46,36 +46,36 @@ UNDERLYING_NEAR_CODE = {
 }
 
 FUNNEL_LABELS = [
-    ("contracts_total", "Taranan put kontratı (hisse filtrelerini geçen hisselerde)"),
-    ("rej_missing", "Eksik / geçersiz veri"),
-    ("rej_dte", "DTE aralığı dışında"),
-    ("rej_delta", "Delta aralığı dışında"),
-    ("rej_oi", "Open interest düşük"),
-    ("rej_volume", "Opsiyon hacmi düşük"),
-    ("rej_bid", "Bid yetersiz"),
-    ("rej_spread", "Bid-ask spread geniş"),
-    ("rej_return", "Yıllık getiri düşük"),
-    ("rej_earnings", "Earnings kuralına takılan"),
-    ("rej_earnings_unknown", "Earnings tarihi bilinmiyor (elendi)"),
-    ("rej_iv", "IV rank / percentile yetersiz"),
-    ("warn_earnings_unknown", "Earnings tarihi bilinmiyor (uyarıyla listeye alındı)"),
-    ("passed", "TÜM FİLTRELERİ GEÇEN"),
+    ("contracts_total", "Put contracts scanned (stocks that passed stock filters)"),
+    ("rej_missing", "Missing / invalid data"),
+    ("rej_dte", "DTE out of range"),
+    ("rej_delta", "Delta out of range"),
+    ("rej_oi", "Open interest too low"),
+    ("rej_volume", "Option volume too low"),
+    ("rej_bid", "Bid too low"),
+    ("rej_spread", "Bid-ask spread too wide"),
+    ("rej_return", "Annualized return too low"),
+    ("rej_earnings", "Failed earnings rule"),
+    ("rej_earnings_unknown", "Earnings date unknown (rejected)"),
+    ("rej_iv", "IV rank / percentile too low"),
+    ("warn_earnings_unknown", "Earnings date unknown (listed with warning)"),
+    ("passed", "PASSED ALL FILTERS"),
 ]
 
-# Yakın kaçan gruplarının başlıkları (gösterim sırası bu listedir)
+# Near-miss group titles (display order)
 NEAR_LABELS = [
-    ("earnings", "Sadece earnings kuralına takılanlar"),
-    ("earnings_unknown", "Sadece earnings tarihi bulunamadığı için elenenler"),
-    ("iv", "Sadece IV rank / percentile'a takılanlar"),
-    ("oi", "Sadece open interest düşük olanlar"),
-    ("volume", "Sadece opsiyon hacmi düşük olanlar"),
-    ("bid", "Sadece bid yetersiz olanlar"),
-    ("spread", "Sadece bid-ask spread geniş olanlar"),
-    ("return", "Sadece yıllık getirisi düşük olanlar"),
-    ("delta", "Sadece delta bandının hemen dışında kalanlar"),
-    ("underlying_price_range", "Sadece hisse fiyat aralığı yüzünden elenenler"),
-    ("underlying_daily_change", "Sadece hisse günlük değişimi yüzünden elenenler"),
-    ("underlying_volume", "Sadece hisse hacmi yüzünden elenenler"),
+    ("earnings", "Failed only the earnings rule"),
+    ("earnings_unknown", "Rejected only because earnings date not found"),
+    ("iv", "Failed only IV rank / percentile"),
+    ("oi", "Failed only on open interest"),
+    ("volume", "Failed only on option volume"),
+    ("bid", "Failed only on bid"),
+    ("spread", "Failed only on bid-ask spread"),
+    ("return", "Failed only on annualized return"),
+    ("delta", "Just outside the delta band (only miss)"),
+    ("underlying_price_range", "Rejected only by stock price range"),
+    ("underlying_daily_change", "Rejected only by stock daily change"),
+    ("underlying_volume", "Rejected only by stock volume"),
 ]
 
 CONTRACT_FILTER_ORDER = ("dte", "delta", "oi", "volume", "bid", "spread", "return")
@@ -114,8 +114,8 @@ def normalise_universe(raw) -> list[str]:
     for item in raw or []:
         if not isinstance(item, str):
             raise ValueError(
-                f"config.yaml 'universe' listesinde sembol olmayan bir giriş var ({item!r}). "
-                "ON, NO, Y, N, OFF gibi semboller tırnak içinde yazılmalı, örneğin: - \"ON\""
+                f"config.yaml 'universe' has a non-symbol entry ({item!r}). "
+                "Symbols like ON, NO, Y, N, OFF must be quoted, e.g.: - \"ON\""
             )
         out.append(item.strip().upper())
     return out
@@ -195,7 +195,7 @@ def apply_iv(cand: dict, metrics: dict) -> None:
 
 # --------------------------------------------------------------------------- earnings kuralları
 def earnings_rules(cfg: dict) -> dict:
-    """Earnings ayarları. Eski config.yaml'da yeni anahtarlar yoksa varsayılanlar geçerli olur."""
+    """Earnings settings. Defaults apply if keys are missing from config.yaml."""
     e = cfg.get("earnings", {}) or {}
     return {
         "min_days": e.get("min_days_to_earnings", 30),          # tarama tarihi ile earnings arası en az bu kadar gün
@@ -220,31 +220,31 @@ def mark_earnings(cand: dict, next_earnings: dt.date | None, unknown_note: str,
     cand["earnings_date"] = next_earnings
     cand["spans_earnings"] = bool(next_earnings and cand["expiry"] >= next_earnings)
     if next_earnings is None:
-        cand["earnings_note"] = f"earnings {unknown_note}"
+        cand["earnings_note"] = f"earnings date {unknown_note}"
     elif cand["spans_earnings"]:
-        cand["earnings_note"] = "vade earnings'i kapsıyor"
+        cand["earnings_note"] = "expiry spans earnings"
     else:
         cand["earnings_note"] = ""
 
 
 def earnings_note_text(cfg: dict) -> str:
     r = earnings_rules(cfg)
-    text = f"Earnings: tarama tarihi ile sonraki earnings arası en az {r['min_days']} gün olmalı."
+    text = f"Earnings: at least {r['min_days']} days between the scan date and the next earnings date."
     if r["expiry_before"]:
-        text += " Ayrıca vade earnings tarihinden önce olmalı."
+        text += " Expiry must also be before the earnings date."
     else:
-        text += " Vade earnings'i kapsayabilir; böyle satırlar 'vade earnings'i kapsıyor' diye işaretlenir."
-    text += (" Tarihi bulunamayan hisseler 'earnings bilinmiyor' uyarısıyla listelenir."
-             if r["unknown"] == "warn" else " Tarihi bulunamayan hisseler elenir.")
+        text += " Expiry may span earnings; such rows are flagged 'expiry spans earnings'."
+    text += (" Stocks with no earnings date are listed with an 'earnings date unknown' warning."
+             if r["unknown"] == "warn" else " Stocks with no earnings date are rejected.")
     etfs = sorted(etf_set(cfg))
     if etfs:
-        text += f" ETF listesindekiler ({', '.join(etfs)}) earnings kuralından muaftır."
+        text += f" ETFs ({', '.join(etfs)}) are exempt from the earnings rule."
     return text
 
 
 def missing_breakdown(result) -> str:
-    labels = [("missing_vade", "vade yok"), ("missing_strike", "strike yok"), ("missing_delta", "delta yok"),
-              ("missing_bid", "bid yok"), ("missing_ask", "ask yok/0")]
+    labels = [("missing_expiry", "no expiry"), ("missing_strike", "no strike"), ("missing_delta", "no delta"),
+              ("missing_bid", "no bid"), ("missing_ask", "ask missing/0")]
     parts = [f"{label} {result.funnel[key]}" for key, label in labels if result.funnel.get(key)]
     return ", ".join(parts)
 
@@ -259,7 +259,7 @@ def price_out_of_range(last: float, ucfg: dict) -> bool:
 
 
 # --------------------------------------------------------------------------- puanlama (0-100)
-SCORE_LABELS = {"return": "Getiri", "safety": "Güvenlik", "liquidity": "Likidite", "earnings": "Earnings", "iv": "IV"}
+SCORE_LABELS = {"return": "Return", "safety": "Safety", "liquidity": "Liquidity", "earnings": "Earnings", "iv": "IV"}
 DEFAULT_SCORE = {
     "weights": {"return": 30, "safety": 30, "liquidity": 20, "earnings": 10, "iv": 10},
     "return_zero_at": 10, "return_full_at": 30,     # yıllık getiri %: 10 -> 0 puan, 30 ve üstü -> 100 puan
@@ -324,10 +324,10 @@ def score_candidate(c: dict, cfg: dict) -> tuple[int | None, dict]:
 def score_note_text(cfg: dict) -> str:
     w = score_settings(cfg)["weights"]
     parts = " · ".join(f"{label} {w[key]:g}" for key, label in SCORE_LABELS.items() if w.get(key))
-    return ("Puan (0-100) ağırlıklı ortalamadır: " + parts + ". Getiri: yıllık getiri; Güvenlik: düşük |delta|; "
-            "Likidite: dar spread + yüksek OI; Earnings: tarih biliniyor ve vade öncesi; IV: IV rank "
-            "(geçmiş birikmediyse bileşen çıkarılır, puan düşmez). Sezgisel bir sıralama yardımcısıdır, "
-            "getiri ya da güvenlik garantisi değildir.")
+    return ("Score (0-100) is a weighted average: " + parts + ". Return: annualized return; Safety: low |delta|; "
+            "Liquidity: tight spread + high OI; Earnings: date known and expiry before it; IV: IV rank "
+            "(dropped while history builds, so it does not lower the score). It is a heuristic ranking aid, "
+            "not a guarantee of return or safety.")
 
 
 # --------------------------------------------------------------------------- filtreler
@@ -353,22 +353,22 @@ def check_underlying(quote: dict | None, ucfg: dict) -> tuple[dict, str | None]:
 
 def underlying_detail(reason: str, info: dict) -> str:
     if reason == "price_range" and info.get("last") is not None:
-        return f"fiyat ${info['last']:,.2f}"
+        return f"price ${info['last']:,.2f}"
     if reason == "underlying_volume":
         vol = info.get("volume")
-        return "hacim yok" if vol is None else f"hacim {vol / 1e6:.2f}M"
+        return "no volume" if vol is None else f"volume {vol / 1e6:.2f}M"
     if reason == "daily_change":
         chg = info.get("change_pct")
-        return "değişim verisi yok" if chg is None else f"günlük {chg:+.1f}%"
+        return "no change data" if chg is None else f"daily {chg:+.1f}%"
     return UNDERLYING_LABELS.get(reason, reason)
 
 
 def evaluate_contracts(rows: list[dict], symbol: str, spot: float, today: dt.date,
                        cfg: dict, funnel: Counter, near: list | None = None) -> list[dict]:
-    """Kontratları filtreler. Tüm filtreleri geçenleri döndürür.
+    """Filters contracts and returns those passing all filters.
 
-    `near` verilirse, yalnızca TEK bir kontrat filtresine takılan kontratlar (delta için
-    bandın hemen dışındakiler) oraya 'yakın kaçan' olarak eklenir.
+    If `near` is given, contracts failing exactly ONE contract filter (for delta: just
+    outside the band) are appended there as near-misses.
     """
     ocfg, rcfg = cfg["option"], cfg["return"]
     delta_tol = cfg.get("output", {}).get("near_miss_delta_tolerance", 0.05)
@@ -380,7 +380,7 @@ def evaluate_contracts(rows: list[dict], symbol: str, spot: float, today: dt.dat
         bid, ask = num(row.get("bid")), num(row.get("ask"))
         missing = []
         if exp is None:
-            missing.append("vade")
+            missing.append("expiry")
         if strike is None or strike <= 0:
             missing.append("strike")
         if delta is None:
@@ -416,17 +416,17 @@ def evaluate_contracts(rows: list[dict], symbol: str, spot: float, today: dt.dat
         if not (ocfg["dte_min"] <= dte <= ocfg["dte_max"]):
             fails["dte"] = f"DTE {dte}"
         if not (ocfg["delta_min"] <= delta <= ocfg["delta_max"]):
-            fails["delta"] = f"delta {delta:.2f} (bant {ocfg['delta_min']}…{ocfg['delta_max']})"
+            fails["delta"] = f"delta {delta:.2f} (band {ocfg['delta_min']}…{ocfg['delta_max']})"
         if oi is None or oi < ocfg["open_interest_min"]:
-            fails["oi"] = "OI yok" if oi is None else f"OI {oi:,.0f} < {ocfg['open_interest_min']}"
+            fails["oi"] = "no OI" if oi is None else f"OI {oi:,.0f} < {ocfg['open_interest_min']}"
         if volume is None or volume < ocfg["option_volume_min"]:
-            fails["volume"] = "hacim yok" if volume is None else f"hacim {volume:,.0f} < {ocfg['option_volume_min']}"
+            fails["volume"] = "no volume" if volume is None else f"volume {volume:,.0f} < {ocfg['option_volume_min']}"
         if not bid > ocfg["bid_gt"]:
             fails["bid"] = f"bid {bid:.2f} ≤ {ocfg['bid_gt']}"
         if not spread_pct < ocfg["spread_pct_lt"]:
-            fails["spread"] = f"spread %{spread_pct:.1f} ≥ %{ocfg['spread_pct_lt']}"
+            fails["spread"] = f"spread {spread_pct:.1f}% ≥ {ocfg['spread_pct_lt']}%"
         if not annualized > rcfg["annualized_gt_pct"]:
-            fails["return"] = f"yıllık %{annualized:.1f} ≤ %{rcfg['annualized_gt_pct']}"
+            fails["return"] = f"annualized {annualized:.1f}% ≤ {rcfg['annualized_gt_pct']}%"
 
         cand = {
             "symbol": symbol, "option_symbol": row.get("optionSymbol", ""), "spot": spot,
@@ -535,12 +535,12 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
                 raise
             except MarketDataError as exc:
                 earnings_failed = True
-                result.errors.append((symbol, f"earnings alınamadı: {exc}"))
+                result.errors.append((symbol, f"earnings lookup failed: {exc}"))
             if next_earnings is None:
                 result.earnings_unknown.append(symbol)
                 if last_earnings:
                     result.last_earnings[symbol] = last_earnings
-        unknown_note = "alınamadı" if earnings_failed else "bilinmiyor"
+        unknown_note = "lookup failed" if earnings_failed else "unknown"
 
         def earnings_status(cand):
             if is_etf:
@@ -557,9 +557,9 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
             if status == "earnings":
                 days = (next_earnings - today).days
                 if days < rules["min_days"]:
-                    return f"earnings {next_earnings:%d.%m.%y} ({days} gün sonra) < {rules['min_days']} gün"
-                return f"vade {cand['expiry']:%d.%m.%y} ≥ earnings {next_earnings:%d.%m.%y}"
-            return "earnings tarihi bulunamadı"
+                    return f"earnings {next_earnings:%d %b %y} (in {days} days) < {rules['min_days']} days"
+                return f"expiry {cand['expiry']:%d %b %y} ≥ earnings {next_earnings:%d %b %y}"
+            return "earnings date not found"
 
         kept = []
         for cand in candidates:
@@ -584,7 +584,7 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
                 if metrics["status"] == "OK":
                     detail = f"IVR {metrics['rank']:.0f} / IVP {metrics['pct']:.0f}"
                 else:
-                    detail = f"IV geçmişi yetersiz ({metrics.get('n')} gün)"
+                    detail = f"IV history insufficient ({metrics.get('n')} days)"
                 cand["miss_code"], cand["miss_detail"] = "iv", detail
                 result.near_misses.append(cand)
                 continue
@@ -620,7 +620,7 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
 
 
 def group_near_misses(result: ScanResult, cfg: dict) -> list[tuple[str, str, int, list[dict]]]:
-    """[(kod, başlık, toplam, gösterilecek kontratlar)] döndürür."""
+    """Returns [(code, title, total, contracts_to_show)]."""
     per_reason = cfg.get("output", {}).get("near_miss_per_reason", 4)
     per_symbol_cap = cfg.get("output", {}).get("near_miss_max_per_symbol", 2)
     groups = []
@@ -650,8 +650,8 @@ def iv_text(c: dict) -> str:
     if c["iv_status"] == "OK":
         return f"{c['iv_rank']:.0f} / {c['iv_pct']:.0f}"
     if c["iv_status"] == "BUILDING":
-        return f"birikiyor ({c['iv_n']})"
-    return "yok"
+        return f"building ({c['iv_n']})"
+    return "n/a"
 
 
 def underlying_reject_groups(result: ScanResult) -> dict[str, list[str]]:
@@ -663,60 +663,60 @@ def underlying_reject_groups(result: ScanResult) -> dict[str, list[str]]:
 
 
 def build_text(result: ScanResult, cfg: dict, today: dt.date) -> str:
-    lines = [f"CSP Scanner - {today:%d.%m.%Y}",
-             f"{len(result.candidates)} aday | {result.symbols_scanned}/{result.symbols_total} hisse tarandı | "
-             f"{result.api_calls} API çağrısı", ""]
+    lines = [f"CSP Scanner - {today:%d %b %Y}",
+             f"{len(result.candidates)} candidates | {result.symbols_scanned}/{result.symbols_total} stocks scanned | "
+             f"{result.api_calls} API calls", ""]
     for c in result.candidates:
-        earnings = "ETF" if c.get("is_etf") else (f"{c['earnings_date']:%d.%m.%y}" if c["earnings_date"] else "-")
+        earnings = "ETF" if c.get("is_etf") else (f"{c['earnings_date']:%d %b %y}" if c["earnings_date"] else "-")
         score = f"[{c['score']:>3}] " if c.get("score") is not None else ""
         lines.append(
-            f"{score}{c['symbol']:<6} {c['expiry']:%d.%m.%y} ({c['dte']}g) strike {c['strike']:.2f} "
-            f"bid {c['bid']:.2f} delta {c['delta']:.2f} yıllık %{c['annualized_pct']:.1f} "
-            f"OTM %{c['otm_pct']:.1f} teminat ${c['collateral']:,.0f} "
+            f"{score}{c['symbol']:<6} {c['expiry']:%d %b %y} ({c['dte']}d) strike {c['strike']:.2f} "
+            f"bid {c['bid']:.2f} delta {c['delta']:.2f} annualized {c['annualized_pct']:.1f}% "
+            f"OTM {c['otm_pct']:.1f}% collateral ${c['collateral']:,.0f} "
             f"IVR/IVP {iv_text(c)} earnings {earnings}"
             + (f" !! {c['earnings_note']}" if c.get("earnings_note") else ""))
-    lines += ["", "Filtre özeti:"]
+    lines += ["", "Filter summary:"]
     for key, label in FUNNEL_LABELS:
         lines.append(f"  {label}: {result.funnel.get(key, 0)}")
     detail = missing_breakdown(result)
     if detail:
-        lines.append(f"  (Eksik veri dökümü, bir kontrat birden fazla alanda eksik olabilir: {detail})")
+        lines.append(f"  (Missing-data breakdown; one contract can miss several fields: {detail})")
 
     groups = group_near_misses(result, cfg)
-    lines += ["", "Yakın kaçanlar (yalnızca tek bir filtreye takılanlar):"]
+    lines += ["", "Near misses (contracts that failed exactly one filter):"]
     if not groups:
-        lines.append("  yok")
+        lines.append("  none")
     for _, label, total, shown in groups:
-        lines.append(f"  {label} - toplam {total} kontrat")
+        lines.append(f"  {label} - {total} contracts total")
         for c in shown:
-            lines.append(f"    {c['symbol']:<6} {c['expiry']:%d.%m.%y} ({c['dte']}g) strike {c['strike']:.2f} "
-                         f"bid {c['bid']:.2f} delta {c['delta']:.2f} yıllık %{c['annualized_pct']:.1f} "
+            lines.append(f"    {c['symbol']:<6} {c['expiry']:%d %b %y} ({c['dte']}d) strike {c['strike']:.2f} "
+                         f"bid {c['bid']:.2f} delta {c['delta']:.2f} annualized {c['annualized_pct']:.1f}% "
                          f"-> {c['miss_detail']}")
     if result.earnings_unknown:
-        lines += ["", "Earnings tarihi bulunamayan hisseler: " + ", ".join(
-            s_ + (f" (son {result.last_earnings[s_]:%d.%m.%y})" if s_ in result.last_earnings else "")
+        lines += ["", "Stocks with no earnings date found: " + ", ".join(
+            s_ + (f" (last {result.last_earnings[s_]:%d %b %y})" if s_ in result.last_earnings else "")
             for s_ in sorted(result.earnings_unknown, key=str))]
     grouped = underlying_reject_groups(result)
     if grouped:
-        lines += ["", "Hisse filtresinde elenenler:"]
+        lines += ["", "Rejected at stock level:"]
         lines += [f"  {label}: {', '.join(items)}" for label, items in grouped.items()]
     if result.errors:
-        lines += ["", "Hatalar:"] + [f"  {s}: {m}" for s, m in result.errors]
-    lines += ["", "Bu liste bir araştırma çıktısıdır, yatırım tavsiyesi değildir."]
+        lines += ["", "Errors:"] + [f"  {s}: {m}" for s, m in result.errors]
+    lines += ["", "This list is research output, not investment advice."]
     return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- HTML tasarımı
-# E-posta istemcileri (Gmail vb.) için güvenli: tablo düzeni + satır içi (inline) stiller, script yok.
-TR_MONTHS = ["Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim",
-             "Kasım", "Aralık"]
-TR_DAYS = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"]
+# Email-client safe (Gmail etc.): table layout + inline styles, no scripts.
 FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
 INK, MUTED, LINE, PAGE, NAVY = "#1c2733", "#6b7785", "#e3e8ee", "#eef1f5", "#0f2740"
 
 
 def tr_date(day: dt.date) -> str:
-    return f"{day.day} {TR_MONTHS[day.month - 1]} {day.year}, {TR_DAYS[day.weekday()]}"
+    months = ["January", "February", "March", "April", "May", "June", "July", "August", "September",
+              "October", "November", "December"]
+    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    return f"{days[day.weekday()]}, {months[day.month - 1]} {day.day}, {day.year}"
 
 
 def _chip(text: str, bg: str, fg: str, title: str = "", extra: str = "") -> str:
@@ -759,15 +759,15 @@ def _kpi(label: str, value: str, sub: str = "", pad: str = "0 3px") -> str:
 
 
 def _warn_chip(note: str) -> str:
-    if "kapsıyor" in note:
-        return _chip("⚠ vade kapsıyor", "#fff3d6", "#8a5a00", note)
-    if "alınamadı" in note:
-        return _chip("⚠ tarih alınamadı", "#fde8e8", "#a12626", note)
-    return _chip("⚠ tarih bilinmiyor", "#fff3d6", "#8a5a00", note)
+    if "spans" in note:
+        return _chip("⚠ expiry spans earnings", "#fff3d6", "#8a5a00", note)
+    if "failed" in note:
+        return _chip("⚠ date lookup failed", "#fde8e8", "#a12626", note)
+    return _chip("⚠ date unknown", "#fff3d6", "#8a5a00", note)
 
 
 def _score_colors(score: int) -> tuple[str, str, str]:
-    """(rozet zemini, yazı rengi, çubuk rengi)"""
+    """(badge background, text color, bar color)"""
     if score >= 70:
         return "#1f9d57", "#ffffff", "#1f9d57"
     if score >= 55:
@@ -795,41 +795,41 @@ def score_legend_html(cfg: dict) -> str:
     chips = "".join(_chip(label, *_score_colors(sample)[:2]) for label, sample in
                     (("70–100", 80), ("55–69", 60), ("40–54", 45), ("0–39", 20)))
     parts = " · ".join(f"{label} {w[key]:g}" for key, label in SCORE_LABELS.items() if w.get(key))
-    return (f"<b>Puan (0–100):</b> {chips} ağırlıklı ortalama: {html.escape(parts)}. "
-            "IV geçmişi birikmediyse IV bileşeni çıkarılır, puan düşmez.")
+    return (f"<b>Score (0–100):</b> {chips} weighted average: {html.escape(parts)}. "
+            "While IV history builds, the IV component is dropped and does not lower the score.")
 
 
 def _candidate_row(c: dict, idx: int, min_hist: int, today: dt.date | None = None) -> str:
     esc = html.escape
     bg = "#ffffff" if idx % 2 == 0 else "#fafbfd"
-    earn = f"{c['earnings_date']:%d.%m.%y}" if c["earnings_date"] else "—"
+    earn = f"{c['earnings_date']:%d %b %y}" if c["earnings_date"] else "—"
     note = c.get("earnings_note", "")
     earn_sub = _warn_chip(note) if note else ""
     if c.get("is_etf"):
         earn, earn_sub = "", _chip("ETF", "#e8eefc", "#2c4a9a")
     elif c.get("last_earnings") and not c["earnings_date"]:
-        ago = f" ({(today - c['last_earnings']).days} gün önce)" if today else ""
+        ago = f" ({(today - c['last_earnings']).days} days ago)" if today else ""
         earn_sub += (f'<div style="font-size:10.5px;color:{MUTED};margin-top:3px">'
-                     f'son açıklama {c["last_earnings"]:%d.%m.%y}{ago}</div>')
+                     f'last report {c["last_earnings"]:%d %b %y}{ago}</div>')
     if c["iv_status"] == "OK":
-        iv_top, iv_sub = f"{c['iv_rank']:.0f} / {c['iv_pct']:.0f}", f"{c['iv_n']} gün"
+        iv_top, iv_sub = f"{c['iv_rank']:.0f} / {c['iv_pct']:.0f}", f"{c['iv_n']} days"
     elif c["iv_status"] == "BUILDING":
-        iv_top, iv_sub = f'<span style="color:{MUTED}">birikiyor</span>', f"{c['iv_n']}/{min_hist} gün"
+        iv_top, iv_sub = f'<span style="color:{MUTED}">building</span>', f"{c['iv_n']}/{min_hist} days"
     else:
         iv_top, iv_sub = "—", ""
-    iv_pct = f"IV %{c['iv'] * 100:.0f}" if c.get("iv") is not None else "IV —"
+    iv_pct = f"IV {c['iv'] * 100:.0f}%" if c.get("iv") is not None else "IV —"
     pill = (f'<span style="display:inline-block;padding:2px 9px;border-radius:6px;background:#e3f4ea;color:#146c3a;'
-            f'font-weight:700;font-size:13px">%{c["annualized_pct"]:.1f}</span>')
+            f'font-weight:700;font-size:13px">{c["annualized_pct"]:.1f}%</span>')
     cells = [
         _cell(f'<b style="font-size:14px">{esc(c["symbol"])}</b>', f"${c['spot']:,.2f}", "left"),
         _score_cell(c),
-        _cell(f"{c['expiry']:%d.%m.%y}", f"{c['dte']} gün", "left"),
-        _cell(f"<b>{c['strike']:,.2f}</b>", f"OTM %{c['otm_pct']:.1f}"),
-        _cell(f"{c['bid']:.2f} / {c['ask']:.2f}", f"spread %{c['spread_pct']:.1f}"),
+        _cell(f"{c['expiry']:%d %b %y}", f"{c['dte']} days", "left"),
+        _cell(f"<b>{c['strike']:,.2f}</b>", f"OTM {c['otm_pct']:.1f}%"),
+        _cell(f"{c['bid']:.2f} / {c['ask']:.2f}", f"spread {c['spread_pct']:.1f}%"),
         _cell(f"{c['delta']:.2f}", iv_pct),
-        _cell(fmt(c["open_interest"], 0), f"hacim {fmt(c['volume'], 0)}"),
-        _cell(pill, f"dönem %{c['static_return_pct']:.2f}"),
-        _cell(f"${c['collateral']:,.0f}", f"başabaş {c['breakeven']:,.2f}"),
+        _cell(fmt(c["open_interest"], 0), f"vol {fmt(c['volume'], 0)}"),
+        _cell(pill, f"period {c['static_return_pct']:.2f}%"),
+        _cell(f"${c['collateral']:,.0f}", f"breakeven {c['breakeven']:,.2f}"),
         _cell(earn, earn_sub, "left"),
         _cell(iv_top, iv_sub),
     ]
@@ -838,18 +838,18 @@ def _candidate_row(c: dict, idx: int, min_hist: int, today: dt.date | None = Non
 
 def _near_table(shown: list[dict]) -> str:
     esc = html.escape
-    widths = (11, 12, 11, 9, 9, 9, 10, 29)   # sütun genişlikleri (%), tüm yakın kaçan tablolarında aynı
+    widths = (11, 12, 11, 9, 9, 9, 10, 29)   # column widths (%), same in all near-miss tables
     head = "".join(_th(lbl, al).replace("<th ", f'<th width="{w}%" ', 1) for (lbl, al), w in zip(
-        [("Hisse", "left"), ("Vade", "left"), ("Strike", "right"), ("Bid", "right"), ("Delta", "right"),
-         ("OTM", "right"), ("Yıllık", "right"), ("Takıldığı yer", "left")], widths))
+        [("Stock", "left"), ("Expiry", "left"), ("Strike", "right"), ("Bid", "right"), ("Delta", "right"),
+         ("OTM", "right"), ("Annual", "right"), ("Missed on", "left")], widths))
     rows = []
     for i, c in enumerate(shown):
         bg = "#ffffff" if i % 2 == 0 else "#fafbfd"
         cells = [
             _cell(f"<b>{esc(c['symbol'])}</b>", "", "left"),
-            _cell(f"{c['expiry']:%d.%m.%y}", f"{c['dte']} gün", "left"),
+            _cell(f"{c['expiry']:%d %b %y}", f"{c['dte']} days", "left"),
             _cell(f"{c['strike']:,.2f}"), _cell(f"{c['bid']:.2f}"), _cell(f"{c['delta']:.2f}"),
-            _cell(f"%{c['otm_pct']:.1f}"), _cell(f"<b>%{c['annualized_pct']:.1f}</b>"),
+            _cell(f"{c['otm_pct']:.1f}%"), _cell(f"<b>{c['annualized_pct']:.1f}%</b>"),
             _cell(f'<span style="color:#8a5a00">{esc(c["miss_detail"])}</span>', "", "left", wrap=True),
         ]
         rows.append(f'<tr style="background:{bg}">' + "".join(cells) + "</tr>")
@@ -884,8 +884,8 @@ def _funnel(result: "ScanResult") -> str:
     out = f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{"".join(rows)}</table>'
     detail = missing_breakdown(result)
     if detail:
-        out += (f'<div style="margin-top:8px;font-size:11.5px;color:{MUTED}">Eksik veri dökümü '
-                f'(bir kontrat birden fazla alanda eksik olabilir): {esc(detail)}</div>')
+        out += (f'<div style="margin-top:8px;font-size:11.5px;color:{MUTED}">Missing-data breakdown '
+                f'(one contract can miss several fields): {esc(detail)}</div>')
     return out
 
 
@@ -896,30 +896,30 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
     evaluated = result.symbols_scanned - len(result.underlying_rejects)
     warn_rows = sum(1 for c in result.candidates if c.get("earnings_note"))
 
-    # ---- başlık bandı + özet kutuları
+    # ---- header band + summary tiles
     header = (
         f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{NAVY};'
         f'border-radius:10px;margin:0 0 12px"><tr><td style="padding:22px 24px">'
-        f'<div style="font-size:11px;letter-spacing:1.6px;color:#8fb3d9;font-weight:700">CASH SECURED PUT TARAMASI</div>'
+        f'<div style="font-size:11px;letter-spacing:1.6px;color:#8fb3d9;font-weight:700">CASH SECURED PUT SCAN</div>'
         f'<div style="font-size:26px;font-weight:700;color:#ffffff;margin-top:4px;line-height:30px">CSP Scanner</div>'
-        f'<div style="font-size:13px;color:#c5d5e6;margin-top:4px">{tr_date(today)} · {result.api_calls} API çağrısı</div>'
+        f'<div style="font-size:13px;color:#c5d5e6;margin-top:4px">{tr_date(today)} · {result.api_calls} API calls</div>'
         f'</td><td align="right" valign="middle" style="padding:22px 24px">'
         f'<div style="font-size:38px;font-weight:700;color:#ffffff;line-height:40px">{len(result.candidates)}</div>'
-        f'<div style="font-size:11px;letter-spacing:1.2px;color:#8fb3d9;font-weight:700">ADAY</div></td></tr></table>')
+        f'<div style="font-size:11px;letter-spacing:1.2px;color:#8fb3d9;font-weight:700">CANDIDATES</div></td></tr></table>')
     kpis = (
         f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 14px"><tr>'
-        + _kpi("Taranan hisse", f"{result.symbols_scanned}<span style='font-size:14px;color:{MUTED}'>/{result.symbols_total}</span>", "", "0 3px 0 0")
-        + _kpi("Değerlendirilen", f"{evaluated}", "hisse filtresini geçti", "0 3px")
-        + _kpi("İncelenen kontrat", f"{result.funnel.get('contracts_total', 0):,}", "put, vade ve delta dahil", "0 3px")
-        + _kpi("Filtreyi geçen", f"{passed:,}",
-               f"mailde en iyi {len(result.candidates)}" if passed > len(result.candidates) else "kontrat",
+        + _kpi("Stocks scanned", f"{result.symbols_scanned}<span style='font-size:14px;color:{MUTED}'>/{result.symbols_total}</span>", "", "0 3px 0 0")
+        + _kpi("Evaluated", f"{evaluated}", "passed stock filters", "0 3px")
+        + _kpi("Contracts checked", f"{result.funnel.get('contracts_total', 0):,}", "puts, all expiries and deltas", "0 3px")
+        + _kpi("Passed filters", f"{passed:,}",
+               f"top {len(result.candidates)} shown" if passed > len(result.candidates) else "contracts",
                "0 0 0 3px")
         + "</tr></table>")
 
-    # ---- adaylar
+    # ---- candidates
     if result.candidates:
-        head = "".join([_th("Hisse", "left"), _th("Puan", "center"), _th("Vade", "left"), _th("Strike"),
-                        _th("Bid / Ask"), _th("Delta / IV"), _th("OI / Hacim"), _th("Yıllık"), _th("Teminat"),
+        head = "".join([_th("Stock", "left"), _th("Score", "center"), _th("Expiry", "left"), _th("Strike"),
+                        _th("Bid / Ask"), _th("Delta / IV"), _th("OI / Vol"), _th("Annual"), _th("Collateral"),
                         _th("Earnings", "left"), _th("IVR / IVP")])
         rows = "".join(_candidate_row(c, i, min_hist, today) for i, c in enumerate(result.candidates))
         body = (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
@@ -929,49 +929,49 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
         if any(c.get("score") is not None for c in result.candidates):
             legend.append(score_legend_html(cfg))
         if warn_rows:
-            legend.append(f"{_chip('⚠ vade kapsıyor', '#fff3d6', '#8a5a00')} opsiyonun vadesi earnings tarihinden sonra, "
-                          "pozisyon açıklamayı açık taşır.")
-            legend.append(f"{_chip('⚠ tarih bilinmiyor', '#fff3d6', '#8a5a00')} MarketData sonraki earnings tarihini "
-                          "vermedi, kendin doğrula.")
+            legend.append(f"{_chip('⚠ expiry spans earnings', '#fff3d6', '#8a5a00')} the option expires after the earnings date, "
+                          "so the position is held through the report.")
+            legend.append(f"{_chip('⚠ date unknown', '#fff3d6', '#8a5a00')} MarketData did not return the next earnings date; "
+                          "verify it yourself.")
         if result.earnings_unknown:
             chips = "".join(
-                _chip(s + (f" · son {result.last_earnings[s]:%d.%m.%y}" if s in result.last_earnings else ""),
+                _chip(s + (f" · last {result.last_earnings[s]:%d %b %y}" if s in result.last_earnings else ""),
                       "#fff3d6", "#8a5a00") for s in sorted(result.earnings_unknown, key=str))
-            legend.append(f"<b>Earnings tarihi bulunamayan hisseler:</b> {chips}")
+            legend.append(f"<b>Stocks with no earnings date found:</b> {chips}")
             if result.last_earnings:
-                legend.append("Yakın zamanda açıklama yapmış bir hissenin sonraki açıklaması genelde ~3 ay sonradır; "
-                              "yine de kendin doğrula.")
+                legend.append("A stock that reported recently usually reports again in ~3 months; "
+                              "still verify it yourself.")
         if any(c.get("is_etf") for c in result.candidates):
-            legend.append(f"{_chip('ETF', '#e8eefc', '#2c4a9a')} earnings kuralından muaf; puanda earnings bileşeni yok.")
+            legend.append(f"{_chip('ETF', '#e8eefc', '#2c4a9a')} exempt from the earnings rule; no earnings component in the score.")
         if legend:
             body += (f'<div style="margin-top:10px;font-size:11.5px;line-height:20px;color:{MUTED}">'
                      + "<br>".join(legend) + "</div>")
-        order = ("Yıllık getiriye göre sıralı." if (cfg.get("output", {}) or {}).get("sort_by", "score") == "annualized"
-                 else "Puana göre sıralı.")
-        cards = _card("Adaylar", body, order + " Yıllık = bid / strike × 365 / DTE · "
-                                              "Teminat = strike × 100 · Başabaş = strike − bid")
+        order = ("Sorted by annualized return." if (cfg.get("output", {}) or {}).get("sort_by", "score") == "annualized"
+                 else "Sorted by score.")
+        cards = _card("Candidates", body, order + " Annualized = bid / strike × 365 / DTE · "
+                                              "Collateral = strike × 100 · Breakeven = strike − bid")
     else:
-        cards = _card("Adaylar",
+        cards = _card("Candidates",
                       f'<div style="background:#f6f8fb;border:1px dashed #c3cfdb;border-radius:8px;padding:16px;'
-                      f'font-size:13px;color:{INK}"><b>Bugün tüm filtreleri geçen aday bulunamadı.</b> '
-                      f'Aşağıdaki yakın kaçanlar ve filtre özeti nedenini gösterir.</div>')
+                      f'font-size:13px;color:{INK}"><b>No candidate passed all filters today.</b> '
+                      f'The near misses and filter summary below show why.</div>')
 
-    # ---- yakın kaçanlar
+    # ---- near misses
     groups = group_near_misses(result, cfg)
     if groups:
         near = ""
         for _, label, total, shown in groups:
-            extra = "" if total == len(shown) else f" · en iyi {len(shown)}"
+            extra = "" if total == len(shown) else f" · top {len(shown)}"
             near += (f'<div style="margin:16px 0 6px;font-size:12.5px;font-weight:700;color:{INK}">{esc(label)} '
-                     f'{_chip(f"toplam {total}{extra}", "#eef2f7", "#44566c")}</div>{_near_table(shown)}')
+                     f'{_chip(f"{total} total{extra}", "#eef2f7", "#44566c")}</div>{_near_table(shown)}')
     else:
-        near = f'<div style="font-size:12.5px;color:{MUTED}">Yok.</div>'
-    cards += _card("Yakın kaçanlar", near.replace('margin:16px 0 6px', 'margin:0 0 6px', 1) if groups else near,
-                   "Yalnızca <b>tek bir</b> filtreye takılıp elenen kontratlar. Hangi kuralı gevşetirsen hangi "
-                   "kontratların girebileceğini gösterir.")
+        near = f'<div style="font-size:12.5px;color:{MUTED}">None.</div>'
+    cards += _card("Near misses", near.replace('margin:16px 0 6px', 'margin:0 0 6px', 1) if groups else near,
+                   "Contracts that failed <b>exactly one</b> filter. Shows which contracts would qualify "
+                   "if you relaxed that rule.")
 
-    # ---- filtre özeti + hisse filtresi
-    cards += _card("Filtre özeti", _funnel(result), "Kontrat düzeyinde: her kontrat takıldığı ilk filtreye sayılır.")
+    # ---- filter summary + stock-level filters
+    cards += _card("Filter summary", _funnel(result), "Contract level: each contract is counted under the first filter it fails.")
     grouped = underlying_reject_groups(result)
     if grouped:
         blocks = ""
@@ -980,39 +980,39 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
             blocks += (f'<div style="margin:0 0 8px"><div style="font-size:12px;font-weight:700;color:{INK};'
                        f'margin-bottom:4px">{esc(label)} <span style="color:{MUTED};font-weight:400">· {len(items)}</span></div>'
                        f'{chips}</div>')
-        cards += _card("Hisse filtresinde elenenler", blocks, "Bu hisselerin kontratları hiç değerlendirilmedi.")
+        cards += _card("Rejected at stock level", blocks, "The contracts of these stocks were not evaluated.")
 
-    # ---- hatalar
+    # ---- errors
     if result.errors:
         errs = "".join(f"<li>{esc(str(s))}: {esc(m)}</li>" for s, m in result.errors)
         cards += (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#fdf0f0;'
                   f'border:1px solid #f1c6c6;border-radius:10px;margin:0 0 14px"><tr><td style="padding:14px 18px">'
-                  f'<div style="font-size:14px;font-weight:700;color:#a12626">Hatalar</div>'
+                  f'<div style="font-size:14px;font-weight:700;color:#a12626">Errors</div>'
                   f'<ul style="margin:8px 0 0;padding-left:18px;font-size:12px;color:#7a2020">{errs}</ul></td></tr></table>')
 
-    # ---- notlar
+    # ---- notes
     icfg = cfg["iv"]
     notes = [
-        "Veri: MarketData cached modu (en fazla ~20 dk gecikmeli olabilir). Emir vermeden önce güncel fiyatı broker'ında kontrol et.",
+        "Data: MarketData cached mode (can be up to ~20 min old). Check the live price at your broker before placing an order.",
         earnings_note_text(cfg),
         score_note_text(cfg),
-        f"IVR/IVP: kendi biriktirdiğimiz IV geçmişinden hesaplanır (en az {icfg['min_history_days']} gün gerekir). "
-        "'birikiyor' yazıyorsa filtre henüz uygulanmıyor.",
-        "Yakın kaçan = yalnızca tek bir filtreye takılan kontrat. Hisse filtresi yüzünden elenenlerde earnings/IV kontrol edilmez.",
-        "Piyasa değeri (5 milyar $) filtresi uygulanmıyor; evren sana ait takip listesinden oluşuyor.",
+        f"IVR/IVP: computed from our own accumulated IV history (needs at least {icfg['min_history_days']} days). "
+        "While it says 'building', the IV filter is not applied yet.",
+        "Near miss = a contract that failed exactly one filter. Stocks rejected at stock level are not checked for earnings/IV.",
+        "Market-cap filter ($5B) is not applied; the universe is your own watchlist.",
     ]
     note_html = "".join(f"<li style='margin-bottom:3px'>{esc(n)}</li>" for n in notes)
     footer = (f'<div style="padding:4px 6px 0;font-size:11.5px;line-height:17px;color:{MUTED}">'
-              f'<div style="font-weight:700;margin-bottom:4px">Notlar</div>'
+              f'<div style="font-weight:700;margin-bottom:4px">Notes</div>'
               f'<ul style="margin:0 0 12px;padding-left:18px">{note_html}</ul>'
-              f'<div style="border-top:1px solid {LINE};padding-top:10px">CSP Scanner · MarketData verisi · '
-              f'Bu liste bir araştırma çıktısıdır, yatırım tavsiyesi değildir.</div></div>')
+              f'<div style="border-top:1px solid {LINE};padding-top:10px">CSP Scanner · MarketData data · '
+              f'This list is research output, not investment advice.</div></div>')
 
     inner = header + kpis + cards + footer
-    return ('<!DOCTYPE html><html lang="tr"><head><meta charset="utf-8">'
+    return ('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
             '<meta name="color-scheme" content="light"><meta name="supported-color-schemes" content="light">'
-            f'<title>CSP Scanner {today:%d.%m.%Y}</title></head>'
+            f'<title>CSP Scanner {today:%d %b %Y}</title></head>'
             f'<body style="margin:0;padding:0;background:{PAGE}">'
             f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{PAGE}">'
             f'<tr><td align="center" style="padding:20px 12px">'
@@ -1042,18 +1042,18 @@ def write_outputs(result: ScanResult, cfg: dict, today: dt.date, outdir: Path) -
 
 # --------------------------------------------------------------------------- ana akış
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Günlük CSP tarayıcısı")
+    parser = argparse.ArgumentParser(description="Daily CSP scanner")
     parser.add_argument("--config", default=str(ROOT / "config.yaml"))
     parser.add_argument("--symbols", default=os.environ.get("SYMBOLS_OVERRIDE", ""),
-                        help="Virgülle ayrılmış semboller (test için)")
-    parser.add_argument("--no-mail", action="store_true", help="Mail gönderme, sadece out/ klasörüne yaz")
-    parser.add_argument("--force", action="store_true", help="Piyasa kapalı olsa da çalış")
+                        help="Comma-separated symbols (for testing)")
+    parser.add_argument("--no-mail", action="store_true", help="Do not send mail; write to out/ only")
+    parser.add_argument("--force", action="store_true", help="Run even if the market is closed")
     args = parser.parse_args(argv)
 
     cfg = load_config(Path(args.config))
     token = os.environ.get("MARKETDATA_TOKEN", "").strip()
     if not token:
-        print("HATA: MARKETDATA_TOKEN tanımlı değil (GitHub Secrets).", file=sys.stderr)
+        print("ERROR: MARKETDATA_TOKEN is not set (GitHub Secrets).", file=sys.stderr)
         return 2
 
     today = dt.datetime.now(NY).date()
@@ -1061,7 +1061,7 @@ def main(argv=None) -> int:
         override = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
         symbols = override or normalise_universe(cfg["universe"])
     except ValueError as exc:
-        print(f"HATA: {exc}", file=sys.stderr)
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     md = MarketData(token, max_calls=cfg["safety"]["max_api_calls"],
                     mode=cfg["marketdata"]["mode"], maxage=cfg["marketdata"]["maxage"])
@@ -1069,12 +1069,12 @@ def main(argv=None) -> int:
     try:
         if cfg["safety"]["skip_when_market_closed"] and not args.force:
             if md.market_is_open(today) is False:
-                print(f"{today}: piyasa kapalı, tarama atlandı.")
+                print(f"{today}: market closed, scan skipped.")
                 return 0
         history = IVHistory(ROOT / "data" / "iv_history.csv")
         result = run_scan(cfg, md, history, today, symbols)
     except MarketDataAuthError as exc:
-        print(f"HATA: MarketData yetki hatası: {exc}", file=sys.stderr)
+        print(f"ERROR: MarketData authentication error: {exc}", file=sys.stderr)
         return 2
 
     history.save()
@@ -1087,12 +1087,12 @@ def main(argv=None) -> int:
         password = os.environ.get("GMAIL_APP_PASSWORD", "")
         to = os.environ.get("MAIL_TO", "") or user
         if not (user and password):
-            print("HATA: GMAIL_USER / GMAIL_APP_PASSWORD tanımlı değil.", file=sys.stderr)
+            print("ERROR: GMAIL_USER / GMAIL_APP_PASSWORD is not set.", file=sys.stderr)
             return 2
-        subject = (f"CSP Scanner {today:%d.%m.%Y}: TARAMA BAŞARISIZ" if failed_all
-                   else f"CSP Scanner {today:%d.%m.%Y}: {len(result.candidates)} aday")
+        subject = (f"CSP Scanner {today:%d %b %Y}: SCAN FAILED" if failed_all
+                   else f"CSP Scanner {today:%d %b %Y}: {len(result.candidates)} candidates")
         send_mail(subject, build_text(result, cfg, today), build_html(result, cfg, today), user, password, to)
-        print(f"Mail gönderildi: {to}")
+        print(f"Mail sent: {to}")
     return 1 if failed_all else 0
 
 
