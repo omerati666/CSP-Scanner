@@ -33,12 +33,12 @@ puts:
   - {symbol: ONTO, expiry: 2026-11-20, strike: 200, contracts: 1, premium: 9.00, note: "Nov cycle"}
 
 shares:
-  - {symbol: FSLR, shares: 100, cost: 226.51, premium_collected: }
-  - {symbol: FTNT, shares: 100, cost: 156.21, premium_collected: }
+  - {symbol: FSLR, shares: 100, cost: 240.00, premium_collected: 13.50}
+  - {symbol: FTNT, shares: 100, cost: 160.00, premium_collected: 3.80}
   - {symbol: NLR, shares: 100, cost: 116.74, premium_collected: }
-  - {symbol: ORCL, shares: 100, cost: 162.36, premium_collected: }
-  - {symbol: RKLB, shares: 100, cost: 91.55, premium_collected: }
-  - {symbol: SOXL, shares: 100, cost: 123.51, premium_collected: }
+  - {symbol: ORCL, shares: 100, cost: 170.00, premium_collected: 7.65}
+  - {symbol: RKLB, shares: 100, cost: 100.00, premium_collected: 8.46}
+  - {symbol: SOXL, shares: 100, cost: 132.00, premium_collected: 8.50}
 
 calls:
   # - {symbol: INTC, expiry: 2026-12-18, strike: 60, contracts: 1, premium: 1.10}
