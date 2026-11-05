@@ -182,7 +182,7 @@ hv:
 # bütçeyi aşanları işaretler (elemez) ve puana göre örnek bir sepet önerir.
 exposure:
   limit_usd: 60000        # toplam izin verilen assignment exposure (strike x 100 toplamı)
-  used_usd: 0             # şu an açık naked put'ların toplam exposure'ı - elle güncelle
+  used_usd: 0             # ekstra elle eklenecek tutar (positions.yaml'daki açık putlar otomatik eklenir; normalde 0 bırak)
   basket_max_per_group: 2 # örnek sepette aynı gruptan en fazla kaç hisse
 
 # Gruplar: yoğunlaşmayı görmek için. Listede olmayan hisse "Other" sayılır. İstediğin gibi düzenle.
@@ -247,3 +247,10 @@ groups:
     - "LLY"
     - "TMO"
     - "UNH"
+
+# Wheel takibi: positions.yaml dosyasındaki pozisyonları rapora ekler (dosya yoksa kart görünmez)
+wheel:
+  enabled: true
+  profit_take_pct: 50        # satılan primin %50'si kazanıldıysa "kapatmayı düşün" uyarısı
+  near_strike_pct: 3         # hisse strike'a %3'ten yakınsa uyarı
+  expiry_warn_days: 7        # vadeye 7 gün kala uyarı

@@ -114,6 +114,12 @@ class MarketData:
         rows.sort(key=lambda r: r["t"])
         return [float(r["c"]) for r in rows]
 
+    def option_quote(self, option_symbol: str) -> dict | None:
+        """Tek opsiyon kontratı için anlık teklif (1 kredi)."""
+        body = self._get(f"/options/quotes/{option_symbol}/")
+        rows = columnar_rows(body) if body else []
+        return rows[0] if rows else None
+
     def market_is_open(self, day: dt.date) -> bool | None:
         """True/False döner; belirlenemezse None (tarama yine de devam eder)."""
         try:

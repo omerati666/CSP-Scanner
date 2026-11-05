@@ -374,8 +374,11 @@ def exposure_settings(cfg: dict) -> dict | None:
     if not e:
         return None
     limit = float(e.get("limit_usd", 60000))
-    used = float(e.get("used_usd", 0))
-    return {"limit": limit, "used": used, "available": max(0.0, limit - used),
+    manual = float(e.get("used_usd", 0))
+    from_positions = float(cfg.get("_positions_used", 0) or 0)
+    used = manual + from_positions
+    return {"limit": limit, "used": used, "manual": manual, "from_positions": from_positions,
+            "available": max(0.0, limit - used),
             "max_per_group": int(e.get("basket_max_per_group", 2))}
 
 
@@ -502,6 +505,173 @@ def analyze_changes(result, log: CandidateLog, today: dt.date) -> dict | None:
     unchanged = len(cur) - len(new) - len(movers)
     return {"prev_date": prev_days[0], "new": new, "dropped": dropped, "movers": movers,
             "unchanged": max(0, unchanged)}
+
+
+# --------------------------------------------------------------------------- Wheel: pozisyon takibi
+def occ_symbol(symbol: str, expiry: dt.date, side: str, strike: float) -> str:
+    """OCC opsiyon sembolü, örn. AAPL261218P00200000."""
+    return f"{symbol}{expiry:%y%m%d}{'P' if side == 'put' else 'C'}{int(round(strike * 1000)):08d}"
+
+
+def load_positions(path: Path, today: dt.date) -> dict | None:
+    """positions.yaml'ı okur; hatalı satırları 'problems' listesine yazar, asla çökmez. Dosya yoksa None."""
+    if not path.exists():
+        return None
+    out = {"puts": [], "calls": [], "shares": [], "problems": []}
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        out["problems"].append(f"positions.yaml could not be read: {str(exc).splitlines()[0]}")
+        return out
+    if not isinstance(raw, dict):
+        out["problems"].append("positions.yaml must contain the sections puts:, shares:, calls:")
+        return out
+
+    def fnum(row, key, required=True, positive=True):
+        v = row.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            if required:
+                raise ValueError(f"'{key}' missing or not a number")
+            return None
+        if positive and v <= 0:
+            raise ValueError(f"'{key}' must be positive")
+        return float(v)
+
+    def sym(row):
+        v = row.get("symbol")
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("'symbol' missing (quote symbols like ON, NO: \"ON\")")
+        return v.strip().upper()
+
+    for kind in ("puts", "calls"):
+        for i, row in enumerate(raw.get(kind) or [], 1):
+            try:
+                if not isinstance(row, dict):
+                    raise ValueError("entry must be key: value lines")
+                raw_exp = row.get("expiry")
+                expiry = raw_exp if isinstance(raw_exp, dt.date) and not isinstance(raw_exp, dt.datetime) else (
+                    raw_exp.date() if isinstance(raw_exp, dt.datetime) else to_date(raw_exp, NY))
+                if expiry is None:
+                    raise ValueError("'expiry' missing (write it as 2026-12-18)")
+                n = int(fnum(row, "contracts"))
+                out[kind].append({"symbol": sym(row), "expiry": expiry, "strike": fnum(row, "strike"),
+                                  "contracts": n, "premium": fnum(row, "premium"),
+                                  "expired": expiry < today, "side": kind[:-1], "note": str(row.get("note") or "")})
+            except (ValueError, TypeError) as exc:
+                out["problems"].append(f"{kind}[{i}]: {exc}")
+    for i, row in enumerate(raw.get("shares") or [], 1):
+        try:
+            if not isinstance(row, dict):
+                raise ValueError("entry must be key: value lines")
+            out["shares"].append({"symbol": sym(row), "shares": fnum(row, "shares"), "cost": fnum(row, "cost"),
+                                  "premium_collected": fnum(row, "premium_collected", False, False) or 0.0,
+                                  "note": str(row.get("note") or "")})
+        except (ValueError, TypeError) as exc:
+            out["problems"].append(f"shares[{i}]: {exc}")
+    return out
+
+
+def positions_exposure(pos: dict | None) -> float:
+    """Açık (vadesi geçmemiş) putların assignment tutarı: strike x 100 x kontrat."""
+    if not pos:
+        return 0.0
+    return sum(p["strike"] * 100 * p["contracts"] for p in pos["puts"] if not p["expired"])
+
+
+def wheel_settings(cfg: dict) -> dict:
+    w = cfg.get("wheel") or {}
+    return {"enabled": w.get("enabled", True), "profit_take_pct": float(w.get("profit_take_pct", 50)),
+            "near_strike_pct": float(w.get("near_strike_pct", 3)), "expiry_warn_days": int(w.get("expiry_warn_days", 7))}
+
+
+def _option_status(p: dict, spot, ask, captured, today: dt.date, ws: dict, next_earn) -> list[tuple[str, str]]:
+    """(rozet metni, renk türü) listesi. renk: red / amber / green / grey"""
+    tags = []
+    dte = (p["expiry"] - today).days
+    if p["expired"]:
+        return [("EXPIRED - remove or update in positions.yaml", "red")]
+    if spot is not None:
+        if p["side"] == "put":
+            itm, dist = spot < p["strike"], (spot - p["strike"]) / spot * 100
+        else:
+            itm, dist = spot > p["strike"], (p["strike"] - spot) / spot * 100
+        if itm:
+            tags.append(("ITM: assignment risk" if p["side"] == "put" else "ITM: shares may be called away", "red"))
+        elif dist < ws["near_strike_pct"]:
+            tags.append((f"near strike ({dist:.1f}%)", "amber"))
+    if captured is not None and captured >= ws["profit_take_pct"]:
+        tags.append((f"{captured:.0f}% of profit captured: consider closing", "green"))
+    if dte <= ws["expiry_warn_days"]:
+        tags.append((f"expires in {dte}d", "amber"))
+    if next_earn and next_earn <= p["expiry"]:
+        tags.append((f"earnings {next_earn:%d %b} before expiry", "amber"))
+    return tags
+
+
+def run_wheel(cfg: dict, md, pos: dict | None, today: dt.date) -> dict | None:
+    """Pozisyonlar için canlı fiyatları çeker. Tek pozisyon hatası diğerlerini durdurmaz."""
+    if not pos or not wheel_settings(cfg)["enabled"]:
+        return None
+    ws = wheel_settings(cfg)
+    rcfg = earnings_rules(cfg)
+    symbols = sorted({p["symbol"] for k in ("puts", "calls", "shares") for p in pos[k]})
+    spots, earns, errors = {}, {}, []
+    etfs = etf_set(cfg)
+    for symbol in symbols:
+        try:
+            q = md.quote(symbol)
+            spots[symbol] = num(q.get("last")) if q else None
+        except MarketDataAuthError:
+            raise
+        except MarketDataError as exc:
+            errors.append((symbol, f"quote failed: {exc}"))
+            spots[symbol] = None
+        if symbol in etfs or not any(p["symbol"] == symbol for k in ("puts", "calls") for p in pos[k]):
+            continue
+        try:
+            dates = [d for d in md.earnings_dates(symbol, today, today + dt.timedelta(days=rcfg["lookahead"])) if d >= today]
+            earns[symbol] = min(dates) if dates else None
+        except MarketDataAuthError:
+            raise
+        except MarketDataError:
+            earns[symbol] = None
+    rows = []
+    for kind in ("puts", "calls"):
+        for p in pos[kind]:
+            row = dict(p, kind=kind, spot=spots.get(p["symbol"]), bid=None, ask=None, delta=None, error="",
+                       dte=(p["expiry"] - today).days)
+            if not p["expired"]:
+                try:
+                    q = md.option_quote(occ_symbol(p["symbol"], p["expiry"], p["side"], p["strike"]))
+                    if q:
+                        row["bid"], row["ask"], row["delta"] = num(q.get("bid")), num(q.get("ask")), num(q.get("delta"))
+                    else:
+                        row["error"] = "no quote returned for this contract (check strike/expiry)"
+                except MarketDataAuthError:
+                    raise
+                except MarketDataError as exc:
+                    row["error"] = f"quote failed: {exc}"
+            # geri alma maliyeti = ask (satıcı kapatmak için alıcı olur)
+            ask = row["ask"] if row["ask"] is not None else row["bid"]
+            row["close_cost"] = ask
+            row["captured_pct"] = (p["premium"] - ask) / p["premium"] * 100 if ask is not None else None
+            row["pnl_usd"] = (p["premium"] - ask) * 100 * p["contracts"] if ask is not None else None
+            row["tags"] = _option_status(row, row["spot"], ask, row["captured_pct"], today, ws, earns.get(p["symbol"]))
+            rows.append(row)
+    shares = []
+    for sh in pos["shares"]:
+        spot = spots.get(sh["symbol"])
+        net = sh["cost"] - sh["premium_collected"]
+        shares.append(dict(sh, spot=spot, net_cost=net,
+                           pnl_usd=(spot - sh["cost"]) * sh["shares"] if spot is not None else None,
+                           pnl_with_prem_usd=(spot - net) * sh["shares"] if spot is not None else None,
+                           pnl_with_prem_pct=(spot - net) / net * 100 if spot is not None and net > 0 else None,
+                           below_net=spot is not None and spot < net))
+    live_puts = [r for r in rows if r["kind"] == "puts" and not r["expired"]]
+    return {"options": rows, "shares": shares, "errors": errors, "problems": list(pos["problems"]),
+            "exposure": positions_exposure(pos),
+            "open_put_premium": sum(r["premium"] * 100 * r["contracts"] for r in live_puts),
+            "unrealized": sum(r["pnl_usd"] for r in rows if r["pnl_usd"] is not None and not r["expired"])}
 
 
 # --------------------------------------------------------------------------- filtreler
@@ -651,6 +821,7 @@ class ScanResult:
     listed: list[dict] = field(default_factory=list)      # top_n kesilmeden önceki tüm geçenler (hisse sınırı sonrası)
     hv: dict[str, float] = field(default_factory=dict)
     changes: dict | None = None
+    wheel: dict | None = None
 
 
 def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[str]) -> ScanResult:
@@ -882,6 +1053,23 @@ def build_text(result: ScanResult, cfg: dict, today: dt.date) -> str:
             + (f" IV/HV {c['iv_hv']:.2f}" if c.get("iv_hv") else "")
             + (" NEW" if c.get("is_new") else (f" day{c['streak']}" if c.get("streak", 1) > 1 else ""))
             + (f" [capped: {c['score_cap']}]" if c.get("score_cap") else ""))
+    w = result.wheel
+    if w:
+        lines.append("")
+        lines.append(f"WHEEL: {len([r for r in w['options'] if r['kind'] == 'puts' and not r['expired']])} open puts, "
+                     f"exposure ${w['exposure']:,.0f}, open P/L {_usd(w['unrealized'], True)}")
+        for r in w["options"]:
+            tags = "; ".join(t for t, _ in r["tags"])
+            cap = "-" if r["captured_pct"] is None else f"{r['captured_pct']:.0f}%"
+            lines.append(f"  {r['symbol']:<6} {r['side']} {r['expiry']:%d %b %y} ({r['dte']}d) strike {r['strike']:.2f} "
+                         f"x{r['contracts']} sold {r['premium']:.2f} buy-back "
+                         f"{'-' if r['close_cost'] is None else format(r['close_cost'], '.2f')} captured {cap}"
+                         + (f" !! {tags}" if tags else "") + (f" ({r['error']})" if r["error"] else ""))
+        for sh in w["shares"]:
+            lines.append(f"  {sh['symbol']:<6} shares {sh['shares']:.0f} cost {sh['cost']:.2f} net {sh['net_cost']:.2f} "
+                         f"P/L with premium {_usd(sh['pnl_with_prem_usd'], True)}")
+        for x in w["problems"]:
+            lines.append(f"  !! positions.yaml: {x}")
     ch = result.changes
     if ch:
         lines += ["", f"Changes since {ch['prev_date']:%d %b}: {len(ch['new'])} new, {len(ch['dropped'])} dropped, "
@@ -1154,7 +1342,7 @@ def _budget_card(result: ScanResult, cfg: dict) -> str:
     over = [c for c in result.candidates if c["collateral"] > basket["available"]]
     tiles = (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 6px"><tr>'
              + _kpi("Limit", f"${basket['limit']:,.0f}", "assignment exposure (naked puts)", "0 3px 0 0")
-             + _kpi("Already used", f"${basket['used']:,.0f}", "set in config: exposure.used_usd", "0 3px")
+             + _kpi("Already used", f"${basket['used']:,.0f}", _used_sub(basket), "0 3px")
              + _kpi("Available", f"${basket['available']:,.0f}", "for new positions", "0 0 0 3px")
              + "</tr></table>")
     if basket["picks"]:
@@ -1198,6 +1386,105 @@ def _budget_card(result: ScanResult, cfg: dict) -> str:
                  f"Naked-put assignment exposure = strike × 100 per contract. The basket is picked by score: one contract "
                  f"per stock, at most {basket['max_per_group']} per group, never above the available budget. It is an "
                  "illustration, not advice; correlated groups can fall together.")
+
+
+def _used_sub(basket: dict) -> str:
+    if basket.get("from_positions"):
+        extra = f" + ${basket['manual']:,.0f} manual" if basket.get("manual") else ""
+        return f"open puts in positions.yaml{extra}"
+    return "set in config: exposure.used_usd"
+
+
+_TAG_COLORS = {"red": ("#fde8e8", "#a12626"), "amber": ("#fff3d6", "#8a5a00"),
+               "green": ("#e3f4ea", "#146c3a"), "grey": ("#eef2f7", "#44566c")}
+
+
+def _usd(v, signed=False) -> str:
+    if v is None:
+        return "-"
+    sign = "+" if signed and v > 0 else ""
+    return f"{sign}{'-' if v < 0 else ''}${abs(v):,.0f}"
+
+
+def _pnl_html(v, pct=None) -> str:
+    if v is None:
+        return "-"
+    color = "#146c3a" if v >= 0 else "#a12626"
+    extra = f" ({pct:+.1f}%)" if pct is not None else ""
+    return f'<span style="color:{color};font-weight:700">{_usd(v, True)}{extra}</span>'
+
+
+def _wheel_card(result: ScanResult, cfg: dict, today: dt.date) -> str:
+    w = result.wheel
+    if not w:
+        return ""
+    esc = html.escape
+    ws = wheel_settings(cfg)
+    body = ""
+    if w["problems"]:
+        body += ('<div style="background:#fdf0f0;border:1px solid #f1c6c6;border-radius:8px;padding:10px 12px;margin:0 0 10px;'
+                 'font-size:12px;color:#7a2020"><b>positions.yaml problems (these rows were skipped):</b><ul style="margin:6px 0 0;'
+                 'padding-left:18px">' + "".join(f"<li>{esc(x)}</li>" for x in w["problems"]) + "</ul></div>")
+    if w["errors"]:
+        body += (f'<div style="margin:0 0 8px;font-size:12px;color:#8a5a00">Price lookup problems: '
+                 + esc("; ".join(f"{s}: {m}" for s, m in w["errors"])) + "</div>")
+    puts = [r for r in w["options"] if r["kind"] == "puts"]
+    calls = [r for r in w["options"] if r["kind"] == "calls"]
+
+    def opt_table(rows, title):
+        out = []
+        for r in sorted(rows, key=lambda x: (x["expired"], x["expiry"], x["symbol"])):
+            tags = "".join(_chip(t, *_TAG_COLORS[c]) + " " for t, c in r["tags"])
+            if r["error"]:
+                tags += _chip(r["error"], *_TAG_COLORS["amber"])
+            dist = ""
+            if r["spot"] is not None:
+                d = (r["spot"] - r["strike"]) / r["spot"] * 100 if r["side"] == "put" else (r["strike"] - r["spot"]) / r["spot"] * 100
+                dist = f"{d:+.1f}% to strike"
+            out.append([
+                f"<b>{esc(r['symbol'])}</b>" + (f'<div style="color:{MUTED};font-size:11px">{esc(r["note"])}</div>' if r["note"] else ""),
+                f"{r['expiry']:%d %b %y}" + f'<div style="color:{MUTED};font-size:11px">{r["dte"]}d</div>',
+                f"{r['strike']:,.2f}" + f'<div style="color:{MUTED};font-size:11px">x{r["contracts"]}</div>',
+                f"{r['spot']:,.2f}" + f'<div style="color:{MUTED};font-size:11px">{dist}</div>' if r["spot"] is not None else "-",
+                f"{r['premium']:.2f}",
+                "-" if r["close_cost"] is None else f"{r['close_cost']:.2f}" + (
+                    f'<div style="color:{MUTED};font-size:11px">delta {r["delta"]:.2f}</div>' if r["delta"] is not None else ""),
+                "-" if r["captured_pct"] is None else f"{r['captured_pct']:.0f}%",
+                _pnl_html(r["pnl_usd"]),
+                tags or _chip("OK", *_TAG_COLORS["grey"]),
+            ])
+        return (_sub_title(title) + _mini_table([("Stock", "left"), ("Expiry", "left"), ("Strike", "right"), ("Spot", "right"),
+                                                 ("Sold at", "right"), ("Buy back", "right"), ("Captured", "right"),
+                                                 ("P/L now", "right"), ("Status", "left")], out))
+
+    live_puts = [r for r in puts if not r["expired"]]
+    if puts or calls:
+        tiles = ('<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 6px"><tr>'
+                 + _kpi("Open puts", f"{len(live_puts)}", f"${w['exposure']:,.0f} assignment exposure", "0 3px 0 0")
+                 + _kpi("Premium received", f"${w['open_put_premium']:,.0f}", "open puts, before buy-back", "0 3px")
+                 + _kpi("Open P/L", _pnl_html(w["unrealized"]), "premium minus buy-back cost", "0 0 0 3px")
+                 + "</tr></table>")
+        body += tiles
+    if puts:
+        body += opt_table(puts, "Open short puts")
+    if calls:
+        body += opt_table(calls, "Open covered calls")
+    if w["shares"]:
+        out = []
+        for sh in w["shares"]:
+            tag = _chip("below net cost", *_TAG_COLORS["amber"]) if sh["below_net"] else ""
+            out.append([f"<b>{esc(sh['symbol'])}</b>", f"{sh['shares']:,.0f}", f"{sh['cost']:,.2f}",
+                        f"{sh['premium_collected']:.2f}", f"{sh['net_cost']:,.2f}",
+                        "-" if sh["spot"] is None else f"{sh['spot']:,.2f}",
+                        _pnl_html(sh["pnl_usd"]), _pnl_html(sh["pnl_with_prem_usd"], sh["pnl_with_prem_pct"]), tag])
+        body += _sub_title("Shares from assignment") + _mini_table(
+            [("Stock", "left"), ("Shares", "right"), ("Cost", "right"), ("Premium", "right"), ("Net cost", "right"),
+             ("Spot", "right"), ("Stock P/L", "right"), ("P/L with premium", "right"), ("", "left")], out)
+    if not (puts or calls or w["shares"]) and not w["problems"]:
+        body += f'<div style="font-size:12.5px;color:{MUTED}">positions.yaml has no positions yet.</div>'
+    return _card("Wheel tracker", body,
+                 f"From positions.yaml (you maintain it). Buy back = current ask. Captured = share of the premium you could "
+                 f"keep by closing now; flagged from {ws['profit_take_pct']:.0f}%. Net cost = cost minus premium collected.")
 
 
 def _near_table(shown: list[dict]) -> str:
@@ -1321,7 +1608,7 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
                       f'font-size:13px;color:{INK}"><b>No candidate passed all filters today.</b> '
                       f'The near misses and filter summary below show why.</div>')
 
-    cards = _changes_card(result, cfg, today) + cards + _budget_card(result, cfg)
+    cards = _wheel_card(result, cfg, today) + _changes_card(result, cfg, today) + cards + _budget_card(result, cfg)
 
     # ---- near misses
     groups = group_near_misses(result, cfg)
@@ -1443,7 +1730,15 @@ def main(argv=None) -> int:
                 print(f"{today}: market closed, scan skipped.")
                 return 0
         history = IVHistory(ROOT / "data" / "iv_history.csv")
+        positions = load_positions(ROOT / "positions.yaml", today)
+        cfg["_positions_used"] = positions_exposure(positions)
         result = run_scan(cfg, md, history, today, symbols)
+        try:
+            result.wheel = run_wheel(cfg, md, positions, today)
+        except MarketDataError as exc:                      # takip kartı taramayı asla düşürmesin
+            if isinstance(exc, MarketDataAuthError):
+                raise
+            result.errors.append(("positions", str(exc)))
     except MarketDataAuthError as exc:
         print(f"ERROR: MarketData authentication error: {exc}", file=sys.stderr)
         return 2

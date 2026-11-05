@@ -1,0 +1,39 @@
+# =====================================================================
+#  POZİSYONLARIM  (bu dosyayı sen düzenlersin, scanner her sabah okur)
+# =====================================================================
+#  Nasıl düzenlenir: GitHub'da bu dosyayı aç -> sağ üstte kalem simgesi -> düzenle -> Commit changes.
+#  Kurallar:
+#   - Satırın başındaki "#" işareti o satırı yok sayar (açıklama/örnek).
+#   - Her pozisyon "- {" ile başlar, "}" ile biter, alanlar virgülle ayrılır.
+#   - Tarih mutlaka  YIL-AY-GÜN  (örn. 2026-12-18). Sayılarda ondalık için NOKTA kullan (2.35).
+#   - Sembol ON, NO, Y, N, OFF gibiyse tırnak içine al:  "ON"
+#   - Vadesi geçen satırı sil (ya da başına # koy). Geçmişse rapor "EXPIRED" diye uyarır.
+#
+#  puts:   Sattığın ve hâlâ açık olan putlar.
+#     symbol    : hisse sembolü
+#     expiry    : vade tarihi
+#     strike    : kullanım fiyatı
+#     contracts : kontrat sayısı (1 kontrat = 100 hisse)
+#     premium   : sattığın fiyat, HİSSE BAŞINA (Schwab'da "Fiyat"; 2.35 gibi, 235 değil)
+#     note      : istersen kısa not (zorunlu değil)
+#
+#  shares: Put assign olunca elinde kalan hisseler.
+#     symbol, shares (hisse adedi), cost (aldığın fiyat = put strike'ı),
+#     premium_collected : bu hisse için bugüne kadar topladığın toplam prim, HİSSE BAŞINA (zorunlu değil)
+#
+#  calls:  Elindeki hisselere karşı sattığın ve açık olan covered call'lar (puts ile aynı alanlar).
+#
+#  Assign olduğunda: ilgili put satırını sil, shares bölümüne hisseyi ekle.
+#  Bütçe: puts bölümündeki açık putların (strike x 100 x kontrat) toplamı otomatik olarak
+#  "Already used" rakamına eklenir. config.yaml'daki exposure.used_usd'yi 0 bırak.
+# =====================================================================
+
+puts:
+  # - {symbol: AAPL, expiry: 2026-12-18, strike: 200, contracts: 1, premium: 2.35}
+  # - {symbol: MU,   expiry: 2026-11-27, strike: 750, contracts: 1, premium: 16.45, note: "Nov cycle"}
+
+shares:
+  # - {symbol: INTC, shares: 100, cost: 55.00, premium_collected: 1.80}
+
+calls:
+  # - {symbol: INTC, expiry: 2026-12-18, strike: 60, contracts: 1, premium: 1.10}
