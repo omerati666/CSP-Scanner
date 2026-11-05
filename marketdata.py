@@ -105,6 +105,15 @@ class MarketData:
                     pass
         return sorted(set(dates))
 
+    def daily_closes(self, symbol: str, date_from: dt.date, date_to: dt.date) -> list[float]:
+        """Günlük kapanışlar (eskiden yeniye). 1000 mum = 1 kredi."""
+        body = self._get(f"/stocks/candles/D/{symbol}/",
+                         {"from": date_from.isoformat(), "to": date_to.isoformat()})
+        rows = columnar_rows(body) if body else []
+        rows = [r for r in rows if isinstance(r.get("c"), (int, float)) and isinstance(r.get("t"), (int, float))]
+        rows.sort(key=lambda r: r["t"])
+        return [float(r["c"]) for r in rows]
+
     def market_is_open(self, day: dt.date) -> bool | None:
         """True/False döner; belirlenemezse None (tarama yine de devam eder)."""
         try:

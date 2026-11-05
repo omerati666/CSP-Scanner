@@ -15,6 +15,7 @@ import argparse
 import csv
 import datetime as dt
 import html
+import math
 import os
 import statistics
 import sys
@@ -268,6 +269,9 @@ DEFAULT_SCORE = {
     "oi_zero_at": 300, "oi_full_at": 3000,          # open interest
     "ivr_zero_at": 20, "ivr_full_at": 80,           # IV rank
     "earnings_known": 100, "earnings_spans": 30, "earnings_unknown": 40,
+    # Puan tavanları: çok yüksek IV'li ya da vadesi earnings'i kapsayan satırlar listeyi domine etmesin
+    "iv_cap_above_pct": 100, "iv_cap_score": 70,    # IV % bunun üstündeyse puan en fazla 70
+    "spans_cap_score": 70,                          # vade earnings'i kapsıyorsa puan en fazla 70
 }
 
 
@@ -318,16 +322,186 @@ def score_candidate(c: dict, cfg: dict) -> tuple[int | None, dict]:
         den += weight
     if den == 0:
         return None, {}
-    return round(num_ / den), {k: round(v) for k, v in parts.items() if v is not None}
+    score = round(num_ / den)
+    caps = []
+    iv_pct_now = c["iv"] * 100 if c.get("iv") is not None else None
+    cap_iv = s.get("iv_cap_above_pct")
+    if cap_iv and iv_pct_now is not None and iv_pct_now > cap_iv and score > s["iv_cap_score"]:
+        score = int(s["iv_cap_score"])
+        caps.append(f"IV above {cap_iv:g}%")
+    if c.get("spans_earnings") and score > s["spans_cap_score"]:
+        score = int(s["spans_cap_score"])
+        caps.append("expiry spans earnings")
+    c["score_cap"] = " + ".join(caps)
+    return score, {k: round(v) for k, v in parts.items() if v is not None}
 
 
 def score_note_text(cfg: dict) -> str:
-    w = score_settings(cfg)["weights"]
+    s = score_settings(cfg)
+    w = s["weights"]
     parts = " · ".join(f"{label} {w[key]:g}" for key, label in SCORE_LABELS.items() if w.get(key))
     return ("Score (0-100) is a weighted average: " + parts + ". Return: annualized return; Safety: low |delta|; "
             "Liquidity: tight spread + high OI; Earnings: date known and expiry before it; IV: IV rank "
-            "(dropped while history builds, so it does not lower the score). It is a heuristic ranking aid, "
-            "not a guarantee of return or safety.")
+            "(dropped while history builds, so it does not lower the score). Caps: the score is limited to "
+            f"{s['iv_cap_score']:g} when IV is above {s['iv_cap_above_pct']:g}% and to {s['spans_cap_score']:g} when the expiry "
+            "spans earnings. It is a heuristic ranking aid, not a guarantee of return or safety.")
+
+
+# --------------------------------------------------------------------------- HV, gruplar, bütçe, geçmiş
+def hv_from_closes(closes: list[float], days: int) -> float | None:
+    """Son `days` günlük log getirilerinin yıllıklandırılmış standart sapması (%)."""
+    if len(closes) < days + 1:
+        return None
+    window = closes[-(days + 1):]
+    rets = [math.log(b / a) for a, b in zip(window, window[1:]) if a > 0 and b > 0]
+    if len(rets) < max(2, days):
+        return None
+    return statistics.stdev(rets) * math.sqrt(252) * 100
+
+
+def group_map(cfg: dict) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for name, syms in (cfg.get("groups") or {}).items():
+        for sym in syms or []:
+            if isinstance(sym, str):
+                out[sym.upper()] = str(name)
+    return out
+
+
+def exposure_settings(cfg: dict) -> dict | None:
+    """config.yaml 'exposure' yoksa bütçe görünümü kapalıdır."""
+    e = cfg.get("exposure")
+    if not e:
+        return None
+    limit = float(e.get("limit_usd", 60000))
+    used = float(e.get("used_usd", 0))
+    return {"limit": limit, "used": used, "available": max(0.0, limit - used),
+            "max_per_group": int(e.get("basket_max_per_group", 2))}
+
+
+def build_basket(cands: list[dict], cfg: dict) -> dict | None:
+    """Puana göre açgözlü örnek sepet: hisse başına 1 kontrat, grup başına en fazla N, bütçeyi aşmaz."""
+    ex = exposure_settings(cfg)
+    if not ex:
+        return None
+    left = ex["available"]
+    picks, taken, per_group = [], set(), Counter()
+    ordered = sorted(cands, key=lambda c: (-(c.get("score") if c.get("score") is not None else -1),
+                                           -c["annualized_pct"], c["symbol"]))
+    for c in ordered:
+        grp = c.get("group") or "Other"
+        if c["symbol"] in taken or per_group[grp] >= ex["max_per_group"] or c["collateral"] > left:
+            continue
+        picks.append(c)
+        taken.add(c["symbol"])
+        per_group[grp] += 1
+        left -= c["collateral"]
+    total = sum(c["collateral"] for c in picks)
+    income = sum(c["premium"] * 100 for c in picks)
+    return {"picks": picks, "total": total, "income": income, "left": left, **ex}
+
+
+def cand_key(symbol, expiry, strike) -> tuple[str, str, str]:
+    exp = expiry.isoformat() if isinstance(expiry, dt.date) else str(expiry)
+    return (str(symbol), exp, f"{float(strike):.2f}")
+
+
+class CandidateLog:
+    """data/candidates_history.csv: her tarama gününün listesi (dünle karşılaştırma ve gün sayacı için)."""
+    COLS = ["date", "symbol", "expiry", "strike", "bid", "score", "annualized", "collateral"]
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.rows: list[dict] = []
+        if path.exists():
+            with open(path, newline="", encoding="utf-8") as fh:
+                for row in csv.DictReader(fh):
+                    day = to_date(row.get("date"), NY)
+                    if day and row.get("symbol") and num(row.get("strike")) is not None:
+                        self.rows.append({**row, "_day": day})
+
+    def dates_before(self, today: dt.date) -> list[dt.date]:
+        return sorted({r["_day"] for r in self.rows if r["_day"] < today}, reverse=True)
+
+    def by_date(self, day: dt.date) -> dict[tuple, dict]:
+        out = {}
+        for r in self.rows:
+            if r["_day"] == day:
+                out[cand_key(r["symbol"], r["expiry"], r["strike"])] = r
+        return out
+
+    def record(self, today: dt.date, cands: list[dict], keep_days: int = 90) -> None:
+        start = today - dt.timedelta(days=keep_days)
+        self.rows = [r for r in self.rows if start <= r["_day"] < today]
+        for c in cands:
+            self.rows.append({"date": today.isoformat(), "symbol": c["symbol"], "expiry": c["expiry"].isoformat(),
+                              "strike": f"{c['strike']:.2f}", "bid": f"{c['bid']:.2f}",
+                              "score": "" if c.get("score") is None else c["score"],
+                              "annualized": f"{c['annualized_pct']:.1f}", "collateral": f"{c['collateral']:.0f}",
+                              "_day": today})
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=self.COLS, extrasaction="ignore")
+            writer.writeheader()
+            for r in sorted(self.rows, key=lambda r: (r["_day"], r["symbol"], r["expiry"], float(r["strike"]))):
+                writer.writerow(r)
+
+
+def analyze_changes(result, log: CandidateLog, today: dt.date) -> dict | None:
+    """Dünkü (son tarama günü) listeyle karşılaştırır; adaylara 'is_new' ve 'streak' yazar."""
+    listed = result.listed
+    prev_days = log.dates_before(today)
+    if not prev_days:
+        for c in listed:
+            c["is_new"], c["streak"] = False, 1
+        return None
+    maps = [log.by_date(d) for d in prev_days]
+    prev = maps[0]
+    cur = {cand_key(c["symbol"], c["expiry"], c["strike"]): c for c in listed}
+    for key, c in cur.items():
+        n = 0
+        for m in maps:
+            if key not in m:
+                break
+            n += 1
+        c["streak"], c["is_new"] = n + 1, key not in prev
+
+    near_index = {cand_key(c["symbol"], c["expiry"], c["strike"]): c["miss_detail"] for c in result.near_misses}
+    new = sorted((c for k, c in cur.items() if k not in prev),
+                 key=lambda c: (-(c["score"] if c.get("score") is not None else -1), c["symbol"]))
+    dropped = []
+    for key, row in prev.items():
+        if key in cur:
+            continue
+        sym = row["symbol"]
+        if key in near_index:
+            why = "now fails: " + near_index[key]
+        elif sym in result.underlying_rejects:
+            why = "stock filter: " + underlying_detail(result.underlying_rejects[sym], result.underlying_info.get(sym, {}))
+        elif any(s_ == sym for s_, _ in result.errors):
+            why = "scan error for this stock"
+        else:
+            why = "fails 2+ filters now, or contract no longer listed"
+        dropped.append({"symbol": sym, "expiry": row["expiry"], "strike": float(row["strike"]), "why": why})
+    dropped.sort(key=lambda d: d["symbol"])
+    movers = []
+    for key, c in cur.items():
+        row = prev.get(key)
+        if not row:
+            continue
+        pb, ps = num(row.get("bid")), num(row.get("score"))
+        if not pb:
+            continue
+        chg = (c["bid"] - pb) / pb * 100
+        sdiff = (c["score"] - ps) if (c.get("score") is not None and ps is not None) else 0
+        if abs(chg) >= 15 or abs(sdiff) >= 8:
+            movers.append({"cand": c, "prev_bid": pb, "bid_chg": chg, "prev_score": ps, "score_diff": sdiff})
+    movers.sort(key=lambda m: -abs(m["bid_chg"]))
+    unchanged = len(cur) - len(new) - len(movers)
+    return {"prev_date": prev_days[0], "new": new, "dropped": dropped, "movers": movers,
+            "unchanged": max(0, unchanged)}
 
 
 # --------------------------------------------------------------------------- filtreler
@@ -439,6 +613,7 @@ def evaluate_contracts(rows: list[dict], symbol: str, spot: float, today: dt.dat
             "iv_status": None, "iv_rank": None, "iv_pct": None, "iv_n": None,
             "earnings_note": "", "spans_earnings": False, "score": None, "score_parts": {},
             "miss_code": None, "miss_detail": "",
+            "score_cap": "", "hv": None, "iv_hv": None, "group": "", "is_new": None, "streak": 1,
         }
         if not fails:
             out.append(cand)
@@ -473,6 +648,9 @@ class ScanResult:
     symbols_scanned: int = 0
     api_calls: int = 0
     iv_building: bool = False
+    listed: list[dict] = field(default_factory=list)      # top_n kesilmeden önceki tüm geçenler (hisse sınırı sonrası)
+    hv: dict[str, float] = field(default_factory=dict)
+    changes: dict | None = None
 
 
 def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[str]) -> ScanResult:
@@ -615,6 +793,32 @@ def run_scan(cfg: dict, md, history: IVHistory, today: dt.date, symbols: list[st
         selected.append(cand)
     result.funnel["passed"] = len(all_candidates)
     result.candidates = selected[: cfg["output"]["top_n"]]
+    result.listed = selected
+
+    gmap = group_map(cfg)
+    for cand in selected:
+        cand["group"] = gmap.get(cand["symbol"].upper(), "Other")
+
+    # HV (tarihsel volatilite): yalnızca raporda gösterilen hisseler için (1000 mum = 1 kredi)
+    hcfg = cfg.get("hv") or {}
+    fetch = getattr(md, "daily_closes", None)
+    if hcfg.get("enabled", True) and fetch is not None:
+        days = int(hcfg.get("days", 20))
+        for symbol in sorted({c["symbol"] for c in result.candidates}):
+            try:
+                closes = fetch(symbol, today - dt.timedelta(days=days * 2 + 12), today)
+            except MarketDataAuthError:
+                raise
+            except MarketDataError:
+                continue
+            hv = hv_from_closes(closes, days)
+            if hv:
+                result.hv[symbol] = hv
+        for cand in result.candidates:
+            hv = result.hv.get(cand["symbol"])
+            cand["hv"] = hv
+            if hv and cand.get("iv"):
+                cand["iv_hv"] = cand["iv"] * 100 / hv
     result.api_calls = getattr(md, "calls", 0)
     return result
 
@@ -674,7 +878,26 @@ def build_text(result: ScanResult, cfg: dict, today: dt.date) -> str:
             f"bid {c['bid']:.2f} delta {c['delta']:.2f} annualized {c['annualized_pct']:.1f}% "
             f"OTM {c['otm_pct']:.1f}% collateral ${c['collateral']:,.0f} "
             f"IVR/IVP {iv_text(c)} earnings {earnings}"
-            + (f" !! {c['earnings_note']}" if c.get("earnings_note") else ""))
+            + (f" !! {c['earnings_note']}" if c.get("earnings_note") else "")
+            + (f" IV/HV {c['iv_hv']:.2f}" if c.get("iv_hv") else "")
+            + (" NEW" if c.get("is_new") else (f" day{c['streak']}" if c.get("streak", 1) > 1 else ""))
+            + (f" [capped: {c['score_cap']}]" if c.get("score_cap") else ""))
+    ch = result.changes
+    if ch:
+        lines += ["", f"Changes since {ch['prev_date']:%d %b}: {len(ch['new'])} new, {len(ch['dropped'])} dropped, "
+                      f"{len(ch['movers'])} moved, {ch['unchanged']} unchanged"]
+        for c in ch["new"][:8]:
+            lines.append(f"  NEW  {c['symbol']:<6} {c['expiry']:%d %b %y} {c['strike']:.2f} bid {c['bid']:.2f}")
+        for d in ch["dropped"][:8]:
+            lines.append(f"  GONE {d['symbol']:<6} {d['expiry']} {d['strike']:.2f} - {d['why']}")
+    basket = build_basket(result.candidates, cfg)
+    if basket:
+        lines += ["", f"Budget: limit ${basket['limit']:,.0f}, used ${basket['used']:,.0f}, "
+                      f"available ${basket['available']:,.0f}. Example basket (by score, 1 per stock):"]
+        for c in basket["picks"]:
+            lines.append(f"  {c['symbol']:<6} {c['expiry']:%d %b %y} strike {c['strike']:.2f} "
+                         f"collateral ${c['collateral']:,.0f} premium ${c['premium'] * 100:,.0f}")
+        lines.append(f"  Total collateral ${basket['total']:,.0f}, premium ${basket['income']:,.0f}, left ${basket['left']:,.0f}")
     lines += ["", "Filter summary:"]
     for key, label in FUNNEL_LABELS:
         lines.append(f"  {label}: {result.funnel.get(key, 0)}")
@@ -787,6 +1010,10 @@ def _score_cell(c: dict) -> str:
             f'border-radius:7px;background:{bg};color:{fg};font-weight:700;font-size:14px;text-align:center">{score}</span>')
     meter = (f'<div style="height:3px;border-radius:2px;background:#e8edf2;width:44px;margin:5px auto 0">'
              f'<div style="height:3px;border-radius:2px;background:{bar};width:{score}%"></div></div>')
+    cap = c.get("score_cap")
+    if cap:
+        meter += (f'<div title="{html.escape("Score capped: " + cap, quote=True)}" style="font-size:9.5px;color:#8a5a00;'
+                  f'margin-top:3px;letter-spacing:.3px">CAPPED</div>')
     return _cell(chip, meter, "center")
 
 
@@ -796,10 +1023,11 @@ def score_legend_html(cfg: dict) -> str:
                     (("70–100", 80), ("55–69", 60), ("40–54", 45), ("0–39", 20)))
     parts = " · ".join(f"{label} {w[key]:g}" for key, label in SCORE_LABELS.items() if w.get(key))
     return (f"<b>Score (0–100):</b> {chips} weighted average: {html.escape(parts)}. "
-            "While IV history builds, the IV component is dropped and does not lower the score.")
+            "While IV history builds, the IV component is dropped and does not lower the score. "
+            f"{_chip('CAPPED', '#fff3d6', '#8a5a00')} score limited because IV is very high or the expiry spans earnings.")
 
 
-def _candidate_row(c: dict, idx: int, min_hist: int, today: dt.date | None = None) -> str:
+def _candidate_row(c: dict, idx: int, min_hist: int, today: dt.date | None = None, ex: dict | None = None) -> str:
     esc = html.escape
     bg = "#ffffff" if idx % 2 == 0 else "#fafbfd"
     earn = f"{c['earnings_date']:%d %b %y}" if c["earnings_date"] else "—"
@@ -818,10 +1046,31 @@ def _candidate_row(c: dict, idx: int, min_hist: int, today: dt.date | None = Non
     else:
         iv_top, iv_sub = "—", ""
     iv_pct = f"IV {c['iv'] * 100:.0f}%" if c.get("iv") is not None else "IV —"
+    if c.get("hv"):
+        iv_pct += f" · HV {c['hv']:.0f}%"
+    if c.get("iv_hv"):
+        r = c["iv_hv"]
+        rc = "#146c3a" if r >= 1.2 else ("#8a5a00" if r < 0.9 else MUTED)
+        iv_pct += f'<div style="color:{rc};font-weight:700;margin-top:2px" title="IV divided by 20-day HV">IV/HV {r:.2f}</div>'
+    badge = ""
+    if c.get("is_new") is True:
+        badge = " " + _chip("NEW", "#e3f4ea", "#146c3a")
+    elif c.get("streak", 1) > 1:
+        badge = " " + _chip(f"day {c['streak']}", "#eef2f7", "#44566c", "Days in a row on the list")
+    grp = f'<div style="color:{MUTED};margin-top:2px">{esc(c.get("group") or "")}</div>' if c.get("group") else ""
+    if ex:
+        pct = c["collateral"] / ex["available"] * 100 if ex["available"] else 999
+        if c["collateral"] > ex["available"]:
+            coll_sub = _chip("over budget", "#fde8e8", "#a12626", f"Exceeds ${ex['available']:,.0f} available")
+        else:
+            coll_sub = f"{pct:.0f}% of budget"
+        coll_sub += f'<div>breakeven {c["breakeven"]:,.2f}</div>'
+    else:
+        coll_sub = f"breakeven {c['breakeven']:,.2f}"
     pill = (f'<span style="display:inline-block;padding:2px 9px;border-radius:6px;background:#e3f4ea;color:#146c3a;'
             f'font-weight:700;font-size:13px">{c["annualized_pct"]:.1f}%</span>')
     cells = [
-        _cell(f'<b style="font-size:14px">{esc(c["symbol"])}</b>', f"${c['spot']:,.2f}", "left"),
+        _cell(f'<b style="font-size:14px">{esc(c["symbol"])}</b>{badge}', f"${c['spot']:,.2f}" + grp, "left"),
         _score_cell(c),
         _cell(f"{c['expiry']:%d %b %y}", f"{c['dte']} days", "left"),
         _cell(f"<b>{c['strike']:,.2f}</b>", f"OTM {c['otm_pct']:.1f}%"),
@@ -829,11 +1078,126 @@ def _candidate_row(c: dict, idx: int, min_hist: int, today: dt.date | None = Non
         _cell(f"{c['delta']:.2f}", iv_pct),
         _cell(fmt(c["open_interest"], 0), f"vol {fmt(c['volume'], 0)}"),
         _cell(pill, f"period {c['static_return_pct']:.2f}%"),
-        _cell(f"${c['collateral']:,.0f}", f"breakeven {c['breakeven']:,.2f}"),
+        _cell(f"${c['collateral']:,.0f}", coll_sub),
         _cell(earn, earn_sub, "left"),
         _cell(iv_top, iv_sub),
     ]
     return f'<tr style="background:{bg}">' + "".join(cells) + "</tr>"
+
+
+def _mini_table(headers: list[tuple[str, str]], rows: list[list[str]]) -> str:
+    head = "".join(_th(label, al) for label, al in headers)
+    body = ""
+    for i, r in enumerate(rows):
+        bg = "#ffffff" if i % 2 == 0 else "#fafbfd"
+        body += f'<tr style="background:{bg}">' + "".join(
+            _cell(v, "", al) for v, (_, al) in zip(r, headers)) + "</tr>"
+    return (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+            f'style="border:1px solid {LINE};border-radius:8px;border-collapse:separate;border-spacing:0">'
+            f'<tr>{head}</tr>{body}</table>')
+
+
+def _sub_title(text: str, chip: str = "") -> str:
+    return (f'<div style="margin:16px 0 6px;font-size:12.5px;font-weight:700;color:{INK}">{html.escape(text)} {chip}</div>')
+
+
+def _changes_card(result: ScanResult, cfg: dict, today: dt.date) -> str:
+    esc = html.escape
+    ch = result.changes
+    if not ch:
+        return _card("Changes since last scan",
+                     f'<div style="font-size:12.5px;color:{MUTED}">History starts today. The comparison with the previous '
+                     f'scan appears from the next run.</div>')
+    prev = ch["prev_date"]
+    stats = (_chip(f"{len(ch['new'])} new", "#e3f4ea", "#146c3a")
+             + _chip(f"{len(ch['dropped'])} dropped", "#fde8e8", "#a12626")
+             + _chip(f"{len(ch['movers'])} moved", "#fff3d6", "#8a5a00")
+             + _chip(f"{ch['unchanged']} unchanged", "#eef2f7", "#44566c"))
+    body = f'<div style="margin-bottom:4px">{stats}</div>'
+    if ch["new"]:
+        shown = ch["new"][:8]
+        rows = [[f"<b>{esc(c['symbol'])}</b>", f"{c['expiry']:%d %b %y}", f"{c['strike']:,.2f}", f"{c['bid']:.2f}",
+                 f"{c['annualized_pct']:.1f}%", "—" if c.get("score") is None else str(c["score"])] for c in shown]
+        extra = f" · top {len(shown)} of {len(ch['new'])}" if len(ch["new"]) > len(shown) else ""
+        body += _sub_title("New today", _chip(f"{len(ch['new'])}{extra}", "#eef2f7", "#44566c"))
+        body += _mini_table([("Stock", "left"), ("Expiry", "left"), ("Strike", "right"), ("Bid", "right"),
+                             ("Annual", "right"), ("Score", "right")], rows)
+    if ch["dropped"]:
+        shown = ch["dropped"][:8]
+        rows = [[f"<b>{esc(d['symbol'])}</b>", esc(str(d["expiry"])), f"{d['strike']:,.2f}", esc(d["why"])] for d in shown]
+        extra = f" · top {len(shown)} of {len(ch['dropped'])}" if len(ch["dropped"]) > len(shown) else ""
+        body += _sub_title("Dropped since last scan", _chip(f"{len(ch['dropped'])}{extra}", "#eef2f7", "#44566c"))
+        body += _mini_table([("Stock", "left"), ("Expiry", "left"), ("Strike", "right"), ("Why it left", "left")], rows)
+    if ch["movers"]:
+        shown = ch["movers"][:6]
+        rows = []
+        for m in shown:
+            c = m["cand"]
+            col = "#146c3a" if m["bid_chg"] >= 0 else "#a12626"
+            ps = "—" if m["prev_score"] is None else f"{m['prev_score']:.0f}"
+            ns = "—" if c.get("score") is None else str(c["score"])
+            rows.append([f"<b>{esc(c['symbol'])}</b>", f"{c['expiry']:%d %b %y}", f"{c['strike']:,.2f}",
+                         f'{m["prev_bid"]:.2f} → {c["bid"]:.2f} <span style="color:{col};font-weight:700">'
+                         f'({m["bid_chg"]:+.0f}%)</span>', f"{ps} → {ns}"])
+        body += _sub_title("Biggest movers", _chip("bid ±15% or score ±8", "#eef2f7", "#44566c"))
+        body += _mini_table([("Stock", "left"), ("Expiry", "left"), ("Strike", "right"), ("Bid", "right"),
+                             ("Score", "right")], rows)
+    return _card(f"Changes since last scan ({prev:%d %b})", body,
+                 "Compared with the previous scan day. Same stock + expiry + strike = same contract.")
+
+
+def _budget_card(result: ScanResult, cfg: dict) -> str:
+    esc = html.escape
+    basket = build_basket(result.candidates, cfg)
+    if not basket:
+        return ""
+    over = [c for c in result.candidates if c["collateral"] > basket["available"]]
+    tiles = (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 6px"><tr>'
+             + _kpi("Limit", f"${basket['limit']:,.0f}", "assignment exposure (naked puts)", "0 3px 0 0")
+             + _kpi("Already used", f"${basket['used']:,.0f}", "set in config: exposure.used_usd", "0 3px")
+             + _kpi("Available", f"${basket['available']:,.0f}", "for new positions", "0 0 0 3px")
+             + "</tr></table>")
+    if basket["picks"]:
+        rows = []
+        running = 0.0
+        for c in basket["picks"]:
+            running += c["collateral"]
+            warn = " ⚠" if c.get("earnings_note") else ""
+            rows.append([f"<b>{esc(c['symbol'])}</b>{warn}", esc(c.get("group") or ""), f"{c['expiry']:%d %b %y}",
+                         f"{c['strike']:,.2f}", f"${c['collateral']:,.0f}", f"${c['premium'] * 100:,.0f}",
+                         "—" if c.get("score") is None else str(c["score"]), f"${running:,.0f}"])
+        table = _mini_table([("Stock", "left"), ("Group", "left"), ("Expiry", "left"), ("Strike", "right"),
+                             ("Collateral", "right"), ("Premium", "right"), ("Score", "right"),
+                             ("Running total", "right")], rows)
+        yield_pct = basket["income"] / basket["total"] * 100 if basket["total"] else 0
+        summary = (f'<div style="margin-top:8px;font-size:12.5px;color:{INK}"><b>Total collateral ${basket["total"]:,.0f}</b> '
+                   f'({basket["total"] / basket["limit"] * 100:.0f}% of the limit) · premium ${basket["income"]:,.0f} '
+                   f'({yield_pct:.1f}% of collateral, before time) · ${basket["left"]:,.0f} left</div>')
+        body = _sub_title("Example basket within the budget") + table.replace(
+            "margin:16px 0 6px", "margin:0 0 6px") + summary
+    else:
+        body = f'<div style="font-size:12.5px;color:{MUTED}">No candidate fits the available budget.</div>'
+    if over:
+        names = ", ".join(sorted({f"{c['symbol']} (${c['collateral']:,.0f})" for c in over}, key=str)[:8])
+        body += (f'<div style="margin-top:8px;font-size:12px;color:#8a5a00">{len(over)} listed contract(s) exceed the available '
+                 f'budget on their own: {esc(names)}. You said you can flex the limit; they are flagged, not removed.</div>')
+    # concentration by group
+    by_group: dict[str, list[str]] = {}
+    for c in result.candidates:
+        by_group.setdefault(c.get("group") or "Other", [])
+        if c["symbol"] not in by_group[c.get("group") or "Other"]:
+            by_group[c.get("group") or "Other"].append(c["symbol"])
+    if by_group:
+        chips = ""
+        for grp, syms in sorted(by_group.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            chips += (f'<div style="margin:0 0 6px;font-size:12px;color:{INK}"><b>{esc(grp)}</b> '
+                      f'<span style="color:{MUTED}">· {len(syms)} stock(s)</span><br>'
+                      + "".join(_chip(x, "#eef2f7", "#44566c") for x in syms) + "</div>")
+        body += _sub_title("Concentration: stocks in today's list by group") + chips
+    return _card("Budget and concentration", tiles + body,
+                 f"Naked-put assignment exposure = strike × 100 per contract. The basket is picked by score: one contract "
+                 f"per stock, at most {basket['max_per_group']} per group, never above the available budget. It is an "
+                 "illustration, not advice; correlated groups can fall together.")
 
 
 def _near_table(shown: list[dict]) -> str:
@@ -921,7 +1285,8 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
         head = "".join([_th("Stock", "left"), _th("Score", "center"), _th("Expiry", "left"), _th("Strike"),
                         _th("Bid / Ask"), _th("Delta / IV"), _th("OI / Vol"), _th("Annual"), _th("Collateral"),
                         _th("Earnings", "left"), _th("IVR / IVP")])
-        rows = "".join(_candidate_row(c, i, min_hist, today) for i, c in enumerate(result.candidates))
+        ex = exposure_settings(cfg)
+        rows = "".join(_candidate_row(c, i, min_hist, today, ex) for i, c in enumerate(result.candidates))
         body = (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
                 f'style="border:1px solid {LINE};border-radius:8px;border-collapse:separate;border-spacing:0">'
                 f'<tr>{head}</tr>{rows}</table>')
@@ -955,6 +1320,8 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
                       f'<div style="background:#f6f8fb;border:1px dashed #c3cfdb;border-radius:8px;padding:16px;'
                       f'font-size:13px;color:{INK}"><b>No candidate passed all filters today.</b> '
                       f'The near misses and filter summary below show why.</div>')
+
+    cards = _changes_card(result, cfg, today) + cards + _budget_card(result, cfg)
 
     # ---- near misses
     groups = group_near_misses(result, cfg)
@@ -996,6 +1363,8 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
         "Data: MarketData cached mode (can be up to ~20 min old). Check the live price at your broker before placing an order.",
         earnings_note_text(cfg),
         score_note_text(cfg),
+        "HV = 20-day historical volatility from daily closes (annualized). IV/HV above 1 means the option is priced above "
+        "the stock's recent real movement; shown only for stocks in the list.",
         f"IVR/IVP: computed from our own accumulated IV history (needs at least {icfg['min_history_days']} days). "
         "While it says 'building', the IV filter is not applied yet.",
         "Near miss = a contract that failed exactly one filter. Stocks rejected at stock level are not checked for earnings/IV.",
@@ -1028,7 +1397,8 @@ def write_outputs(result: ScanResult, cfg: dict, today: dt.date, outdir: Path) -
     cols = ["symbol", "score", "score_return", "score_safety", "score_liquidity", "score_earnings", "score_iv",
             "option_symbol", "spot", "expiry", "dte", "strike", "bid", "ask", "delta", "iv",
             "open_interest", "volume", "spread_pct", "otm_pct", "annualized_pct", "breakeven",
-            "collateral", "earnings_date", "last_earnings", "is_etf", "earnings_note", "iv_status", "iv_rank", "iv_pct"]
+            "collateral", "earnings_date", "last_earnings", "is_etf", "earnings_note", "iv_status", "iv_rank", "iv_pct",
+            "hv", "iv_hv", "group", "streak", "is_new", "score_cap"]
     with open(outdir / "candidates.csv", "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         writer.writeheader()
@@ -1057,6 +1427,7 @@ def main(argv=None) -> int:
         return 2
 
     today = dt.datetime.now(NY).date()
+    override: list[str] = []
     try:
         override = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
         symbols = override or normalise_universe(cfg["universe"])
@@ -1078,10 +1449,15 @@ def main(argv=None) -> int:
         return 2
 
     history.save()
+    failed_all = result.symbols_scanned == 0
+    clog = CandidateLog(ROOT / "data" / "candidates_history.csv")
+    result.changes = analyze_changes(result, clog, today)
+    if not failed_all and not override:        # test çalıştırmaları (--symbols) geçmişi bozmasın
+        clog.record(today, result.listed)
+        clog.save()
     write_outputs(result, cfg, today, ROOT / "out")
     print(build_text(result, cfg, today))
 
-    failed_all = result.symbols_scanned == 0
     if not args.no_mail:
         user = os.environ.get("GMAIL_USER", "")
         password = os.environ.get("GMAIL_APP_PASSWORD", "")

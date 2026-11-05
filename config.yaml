@@ -167,3 +167,83 @@ score:
   earnings_known: 100    # earnings tarihi biliniyor ve vade ondan önce
   earnings_spans: 30     # vade earnings'i kapsıyor
   earnings_unknown: 40   # earnings tarihi bilinmiyor
+  # Puan tavanları: bu durumlarda puan, hesaplanan değer ne olursa olsun bu sayıyı geçemez.
+  iv_cap_above_pct: 100  # IV % bunun üstündeyse (ör. SOXL, BE) ...
+  iv_cap_score: 70       # ... puan en fazla 70 olur. Kapatmak için iv_cap_above_pct: 0 yaz.
+  spans_cap_score: 70    # vade earnings'i kapsıyorsa puan en fazla 70 olur (kapatmak için 100 yaz)
+
+# HV (tarihsel volatilite): raporda IV/HV oranı için. Yalnızca raporda gösterilen hisseler için çekilir
+# (1000 günlük mum = 1 API kredisi, yani maliyeti ihmal edilebilir).
+hv:
+  enabled: true
+  days: 20               # kaç günlük HV
+
+# Naked put (assignment) bütçen. Rapor her satırda teminatın bütçenin yüzde kaçı olduğunu gösterir,
+# bütçeyi aşanları işaretler (elemez) ve puana göre örnek bir sepet önerir.
+exposure:
+  limit_usd: 60000        # toplam izin verilen assignment exposure (strike x 100 toplamı)
+  used_usd: 0             # şu an açık naked put'ların toplam exposure'ı - elle güncelle
+  basket_max_per_group: 2 # örnek sepette aynı gruptan en fazla kaç hisse
+
+# Gruplar: yoğunlaşmayı görmek için. Listede olmayan hisse "Other" sayılır. İstediğin gibi düzenle.
+groups:
+  Semis:
+    - "AMD"
+    - "ARM"
+    - "ASML"
+    - "AVGO"
+    - "CRDO"
+    - "GLW"
+    - "INTC"
+    - "LITE"
+    - "LRCX"
+    - "MRVL"
+    - "MU"
+    - "NVDA"
+    - "ONTO"
+    - "SKHY"
+    - "SNDK"
+    - "SOXL"
+    - "TSM"
+  Software:
+    - "CRWD"
+    - "DDOG"
+    - "FTNT"
+    - "NOW"
+    - "NTSK"
+    - "OKTA"
+    - "ORCL"
+    - "PANW"
+    - "PLTR"
+    - "S"
+    - "SHOP"
+    - "ZS"
+  Mega-cap:
+    - "AAPL"
+    - "AMZN"
+    - "GOOGL"
+    - "META"
+    - "MSFT"
+    - "NFLX"
+    - "TSLA"
+  AI infra:
+    - "APLD"
+    - "BE"
+    - "CRWV"
+    - "FIX"
+    - "NBIS"
+    - "NVT"
+    - "VRT"
+  Financials:
+    - "CME"
+    - "DAVE"
+    - "MA"
+    - "SOFI"
+    - "SPGI"
+  Health:
+    - "HCA"
+    - "HIMS"
+    - "ISRG"
+    - "LLY"
+    - "TMO"
+    - "UNH"
