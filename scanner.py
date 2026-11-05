@@ -584,6 +584,19 @@ def wheel_settings(cfg: dict) -> dict:
             "near_strike_pct": float(w.get("near_strike_pct", 3)), "expiry_warn_days": int(w.get("expiry_warn_days", 7))}
 
 
+def mark_held(cands: list[dict], wheel: dict | None) -> None:
+    """Adaylara 'held' yazar: o hissede zaten hisse veya açık put varsa (aynı hissede riski katlamamak için)."""
+    held: dict[str, list[str]] = {}
+    if wheel:
+        for sh in wheel["shares"]:
+            held.setdefault(sh["symbol"], []).append(f"{sh['shares']:,.0f} shares")
+        for r in wheel["options"]:
+            if r["kind"] == "puts" and not r["expired"]:
+                held.setdefault(r["symbol"], []).append(f"{r['contracts']} open put" + ("s" if r["contracts"] > 1 else ""))
+    for c in cands:
+        c["held"] = " + ".join(held.get(c["symbol"], []))
+
+
 def cc_settings(cfg: dict) -> dict:
     c = (cfg.get("wheel") or {}).get("cc") or {}
     return {"dte_min": int(c.get("dte_min", 20)), "dte_max": int(c.get("dte_max", 45)),
@@ -1117,7 +1130,8 @@ def build_text(result: ScanResult, cfg: dict, today: dt.date) -> str:
             + (f" !! {c['earnings_note']}" if c.get("earnings_note") else "")
             + (f" IV/HV {c['iv_hv']:.2f}" if c.get("iv_hv") else "")
             + (" NEW" if c.get("is_new") else (f" day{c['streak']}" if c.get("streak", 1) > 1 else ""))
-            + (f" [capped: {c['score_cap']}]" if c.get("score_cap") else ""))
+            + (f" [capped: {c['score_cap']}]" if c.get("score_cap") else "")
+            + (f" !! ALREADY HOLD: {c['held']}" if c.get("held") else ""))
     w = result.wheel
     if w:
         lines.append("")
@@ -1329,6 +1343,9 @@ def _candidate_row(c: dict, idx: int, min_hist: int, today: dt.date | None = Non
         coll_sub += f'<div>breakeven {c["breakeven"]:,.2f}</div>'
     else:
         coll_sub = f"breakeven {c['breakeven']:,.2f}"
+    if c.get("held"):
+        grp += f'<div style="margin-top:3px">{_chip("already hold", "#fde8e8", "#a12626", c["held"])}</div>' \
+               f'<div style="color:{MUTED};font-size:10.5px">{html.escape(c["held"])}</div>'
     pill = (f'<span style="display:inline-block;padding:2px 9px;border-radius:6px;background:#e3f4ea;color:#146c3a;'
             f'font-weight:700;font-size:13px">{c["annualized_pct"]:.1f}%</span>')
     cells = [
@@ -1425,6 +1442,8 @@ def _budget_card(result: ScanResult, cfg: dict) -> str:
         for c in basket["picks"]:
             running += c["collateral"]
             warn = " ⚠" if c.get("earnings_note") else ""
+            if c.get("held"):
+                warn += " " + _chip("already hold", "#fde8e8", "#a12626", c["held"])
             rows.append([f"<b>{esc(c['symbol'])}</b>{warn}", esc(c.get("group") or ""), f"{c['expiry']:%d %b %y}",
                          f"{c['strike']:,.2f}", f"${c['collateral']:,.0f}", f"${c['premium'] * 100:,.0f}",
                          "—" if c.get("score") is None else str(c["score"]), f"${running:,.0f}"])
@@ -1726,6 +1745,9 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
             if result.last_earnings:
                 legend.append("A stock that reported recently usually reports again in ~3 months; "
                               "still verify it yourself.")
+        if any(c.get("held") for c in result.candidates):
+            legend.append(f"{_chip('already hold', '#fde8e8', '#a12626')} you already hold shares or an open put on this stock "
+                          "(positions.yaml); a new put adds to the same risk.")
         if any(c.get("is_etf") for c in result.candidates):
             legend.append(f"{_chip('ETF', '#e8eefc', '#2c4a9a')} exempt from the earnings rule; no earnings component in the score.")
         if legend:
@@ -1872,6 +1894,7 @@ def main(argv=None) -> int:
             if isinstance(exc, MarketDataAuthError):
                 raise
             result.errors.append(("positions", str(exc)))
+        mark_held(result.listed, result.wheel)
     except MarketDataAuthError as exc:
         print(f"ERROR: MarketData authentication error: {exc}", file=sys.stderr)
         return 2
