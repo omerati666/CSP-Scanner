@@ -29,11 +29,16 @@
 # =====================================================================
 
 puts:
-  # - {symbol: AAPL, expiry: 2026-12-18, strike: 200, contracts: 1, premium: 2.35}
-  # - {symbol: MU,   expiry: 2026-11-27, strike: 750, contracts: 1, premium: 16.45, note: "Nov cycle"}
+  - {symbol: CRM, expiry: 2026-11-20, strike: 220, contracts: 1, premium: 3.60}
+  - {symbol: ONTO, expiry: 2026-11-20, strike: 200, contracts: 1, premium: 9.00, note: "Nov cycle"}
 
 shares:
-  # - {symbol: INTC, shares: 100, cost: 55.00, premium_collected: 1.80}
+  - {symbol: FSLR, shares: 100, cost: 226.51, premium_collected: }
+  - {symbol: FTNT, shares: 100, cost: 156.21, premium_collected: }
+  - {symbol: NLR, shares: 100, cost: 116.74, premium_collected: }
+  - {symbol: ORCL, shares: 100, cost: 162.36, premium_collected: }
+  - {symbol: RKLB, shares: 100, cost: 91.55, premium_collected: }
+  - {symbol: SOXL, shares: 100, cost: 123.51, premium_collected: }
 
 calls:
   # - {symbol: INTC, expiry: 2026-12-18, strike: 60, contracts: 1, premium: 1.10}
