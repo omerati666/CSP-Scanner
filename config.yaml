@@ -254,3 +254,12 @@ wheel:
   profit_take_pct: 50        # satılan primin %50'si kazanıldıysa "kapatmayı düşün" uyarısı
   near_strike_pct: 3         # hisse strike'a %3'ten yakınsa uyarı
   expiry_warn_days: 7        # vadeye 7 gün kala uyarı
+  cc:                        # covered call aday filtreleri (elindeki hisseler için)
+    dte_min: 20
+    dte_max: 45
+    delta_min: 0.15
+    delta_max: 0.35
+    min_oi: 100
+    min_bid: 0.20
+    max_spread_pct: 10
+    top_n: 4                 # hisse başına gösterilecek aday sayısı

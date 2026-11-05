@@ -82,13 +82,16 @@ class MarketData:
         rows = columnar_rows(body) if body else []
         return rows[0] if rows else None
 
-    def put_chain(self, symbol: str, date_from: dt.date, date_to: dt.date) -> list[dict]:
+    def option_chain(self, symbol: str, date_from: dt.date, date_to: dt.date, side: str = "put") -> list[dict]:
         body = self._get(
             f"/options/chain/{symbol}/",
-            {"from": date_from.isoformat(), "to": date_to.isoformat(), "side": "put",
+            {"from": date_from.isoformat(), "to": date_to.isoformat(), "side": side,
              "mode": self.mode, "maxage": self.maxage},
         )
         return columnar_rows(body) if body else []
+
+    def put_chain(self, symbol: str, date_from: dt.date, date_to: dt.date) -> list[dict]:
+        return self.option_chain(symbol, date_from, date_to, "put")
 
     def earnings_dates(self, symbol: str, date_from: dt.date, date_to: dt.date) -> list[dt.date]:
         body = self._get(f"/stocks/earnings/{symbol}/",

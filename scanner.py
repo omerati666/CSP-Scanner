@@ -584,6 +584,44 @@ def wheel_settings(cfg: dict) -> dict:
             "near_strike_pct": float(w.get("near_strike_pct", 3)), "expiry_warn_days": int(w.get("expiry_warn_days", 7))}
 
 
+def cc_settings(cfg: dict) -> dict:
+    c = (cfg.get("wheel") or {}).get("cc") or {}
+    return {"dte_min": int(c.get("dte_min", 20)), "dte_max": int(c.get("dte_max", 45)),
+            "delta_min": float(c.get("delta_min", 0.15)), "delta_max": float(c.get("delta_max", 0.35)),
+            "min_oi": float(c.get("min_oi", 100)), "min_bid": float(c.get("min_bid", 0.20)),
+            "max_spread_pct": float(c.get("max_spread_pct", 10)), "top_n": int(c.get("top_n", 4))}
+
+
+def cc_candidates(rows: list[dict], spot: float, net_cost: float, today: dt.date, cc: dict,
+                  next_earn: dt.date | None, is_etf: bool) -> dict:
+    """Covered call adayları: net maliyetin altında zarara kilitleyenler ayrı tutulur."""
+    good, loss = [], []
+    for row in rows:
+        exp = to_date(row.get("expiration"), NY)
+        strike, delta = num(row.get("strike")), num(row.get("delta"))
+        bid, ask, oi = num(row.get("bid")), num(row.get("ask")), num(row.get("openInterest"))
+        if exp is None or strike is None or strike <= 0 or delta is None or bid is None or not ask or ask <= 0:
+            continue
+        if str(row.get("side", "call")).lower() != "call":
+            continue
+        dte = (exp - today).days
+        spread = 100 * (ask - bid) / ask
+        if not (cc["dte_min"] <= dte <= cc["dte_max"]) or not (cc["delta_min"] <= abs(delta) <= cc["delta_max"]):
+            continue
+        if bid < cc["min_bid"] or spread >= cc["max_spread_pct"] or oi is None or oi < cc["min_oi"]:
+            continue
+        static = bid / net_cost * 100 if net_cost > 0 else 0.0
+        called = (strike + bid - net_cost) / net_cost * 100 if net_cost > 0 else 0.0
+        item = {"expiry": exp, "dte": dte, "strike": strike, "bid": bid, "ask": ask, "delta": abs(delta), "oi": oi,
+                "spread_pct": spread, "otm_pct": (strike - spot) / spot * 100, "static_pct": static,
+                "annualized_pct": static * 365 / dte, "called_pct": called, "called_annual_pct": called * 365 / dte,
+                "spans_earnings": bool(next_earn and exp >= next_earn and not is_etf), "loss_if_called": strike + bid < net_cost}
+        (loss if item["loss_if_called"] else good).append(item)
+    good.sort(key=lambda r: -r["annualized_pct"])
+    loss.sort(key=lambda r: -r["annualized_pct"])
+    return {"good": good[: cc["top_n"]], "good_total": len(good), "loss": loss[:3], "loss_total": len(loss)}
+
+
 def _option_status(p: dict, spot, ask, captured, today: dt.date, ws: dict, next_earn) -> list[tuple[str, str]]:
     """(rozet metni, renk türü) listesi. renk: red / amber / green / grey"""
     tags = []
@@ -626,7 +664,7 @@ def run_wheel(cfg: dict, md, pos: dict | None, today: dt.date) -> dict | None:
         except MarketDataError as exc:
             errors.append((symbol, f"quote failed: {exc}"))
             spots[symbol] = None
-        if symbol in etfs or not any(p["symbol"] == symbol for k in ("puts", "calls") for p in pos[k]):
+        if symbol in etfs:
             continue
         try:
             dates = [d for d in md.earnings_dates(symbol, today, today + dt.timedelta(days=rcfg["lookahead"])) if d >= today]
@@ -667,8 +705,35 @@ def run_wheel(cfg: dict, md, pos: dict | None, today: dt.date) -> dict | None:
                            pnl_with_prem_usd=(spot - net) * sh["shares"] if spot is not None else None,
                            pnl_with_prem_pct=(spot - net) / net * 100 if spot is not None and net > 0 else None,
                            below_net=spot is not None and spot < net))
+    cc_cfg = cc_settings(cfg)
+    cc_out = []
+    for sh in shares:
+        sym = sh["symbol"]
+        covered = sum(c["contracts"] for c in pos["calls"] if c["symbol"] == sym and not c["expired"])
+        whole = int(sh["shares"] // 100)
+        avail = whole - covered
+        item = {"symbol": sym, "shares": sh["shares"], "spot": sh["spot"], "net_cost": sh["net_cost"], "cost": sh["cost"],
+                "whole": whole, "covered": covered, "avail": avail, "error": "", "cands": None,
+                "next_earn": earns.get(sym)}
+        if whole < 1:
+            item["error"] = "fewer than 100 shares: a covered call needs at least 100"
+        elif avail < 1:
+            item["error"] = f"all {whole} contract(s) of this stock already have a call sold"
+        elif sh["spot"] is None:
+            item["error"] = "no stock price"
+        else:
+            try:
+                chain = md.option_chain(sym, today + dt.timedelta(days=cc_cfg["dte_min"]),
+                                        today + dt.timedelta(days=cc_cfg["dte_max"]), "call")
+                item["cands"] = cc_candidates(chain, sh["spot"], sh["net_cost"], today, cc_cfg,
+                                              earns.get(sym), sym in etfs)
+            except MarketDataAuthError:
+                raise
+            except MarketDataError as exc:
+                item["error"] = f"call chain failed: {exc}"
+        cc_out.append(item)
     live_puts = [r for r in rows if r["kind"] == "puts" and not r["expired"]]
-    return {"options": rows, "shares": shares, "errors": errors, "problems": list(pos["problems"]),
+    return {"options": rows, "shares": shares, "cc": cc_out, "errors": errors, "problems": list(pos["problems"]),
             "exposure": positions_exposure(pos),
             "open_put_premium": sum(r["premium"] * 100 * r["contracts"] for r in live_puts),
             "unrealized": sum(r["pnl_usd"] for r in rows if r["pnl_usd"] is not None and not r["expired"])}
@@ -1068,6 +1133,15 @@ def build_text(result: ScanResult, cfg: dict, today: dt.date) -> str:
         for sh in w["shares"]:
             lines.append(f"  {sh['symbol']:<6} shares {sh['shares']:.0f} cost {sh['cost']:.2f} net {sh['net_cost']:.2f} "
                          f"P/L with premium {_usd(sh['pnl_with_prem_usd'], True)}")
+        for it in w.get("cc", []):
+            if it["error"] or not it["cands"]:
+                lines.append(f"  CC {it['symbol']}: {it['error'] or 'none'}")
+                continue
+            for r in (it["cands"]["good"] or it["cands"]["loss"]):
+                lines.append(f"  CC {it['symbol']:<6} {r['expiry']:%d %b %y} ({r['dte']}d) strike {r['strike']:.2f} "
+                             f"bid {r['bid']:.2f} delta {r['delta']:.2f} annual {r['annualized_pct']:.1f}% "
+                             f"if called {r['called_pct']:+.1f}%" + (" !! loss if called" if r["loss_if_called"] else "")
+                             + (" !! spans earnings" if r["spans_earnings"] else ""))
         for x in w["problems"]:
             lines.append(f"  !! positions.yaml: {x}")
     ch = result.changes
@@ -1487,6 +1561,65 @@ def _wheel_card(result: ScanResult, cfg: dict, today: dt.date) -> str:
                  f"keep by closing now; flagged from {ws['profit_take_pct']:.0f}%. Net cost = cost minus premium collected.")
 
 
+def _cc_card(result: ScanResult, cfg: dict) -> str:
+    w = result.wheel
+    if not w or not w.get("cc"):
+        return ""
+    esc = html.escape
+    cc = cc_settings(cfg)
+    body = ""
+    for it in w["cc"]:
+        spot = "-" if it["spot"] is None else f"{it['spot']:,.2f}"
+        head = (f"{it['symbol']} · {it['shares']:,.0f} shares · net cost {it['net_cost']:,.2f} · spot {spot}"
+                + (f" · {it['avail']} contract(s) free" if it["avail"] >= 1 else ""))
+        body += _sub_title(head)
+        if it["error"]:
+            body += f'<div style="font-size:12.5px;color:{MUTED}">{esc(it["error"])}</div>'
+            continue
+        c = it["cands"]
+        if not c["good"] and not c["loss"]:
+            body += f'<div style="font-size:12.5px;color:{MUTED}">No call passed the filters.</div>'
+            continue
+
+        def table(items, tint=False):
+            out = []
+            for r in items:
+                tags = ""
+                if r["loss_if_called"]:
+                    tags += _chip("locks in a loss if called", *_TAG_COLORS["red"]) + " "
+                if r["spans_earnings"]:
+                    tags += _chip("⚠ spans earnings", *_TAG_COLORS["amber"]) + " "
+                total = r["bid"] * 100 * it["avail"]
+                out.append([f"{r['expiry']:%d %b %y}" + f'<div style="color:{MUTED};font-size:11px">{r["dte"]}d</div>',
+                            f"<b>{r['strike']:,.2f}</b>" + f'<div style="color:{MUTED};font-size:11px">OTM {r["otm_pct"]:.1f}%</div>',
+                            f"{r['bid']:.2f} / {r['ask']:.2f}" + f'<div style="color:{MUTED};font-size:11px">spread {r["spread_pct"]:.1f}%</div>',
+                            f"{r['delta']:.2f}" + f'<div style="color:{MUTED};font-size:11px">OI {r["oi"]:,.0f}</div>',
+                            f"${total:,.0f}" + f'<div style="color:{MUTED};font-size:11px">{r["static_pct"]:.2f}% of net cost</div>',
+                            f'<b style="color:#146c3a">{r["annualized_pct"]:.1f}%</b>',
+                            f"{r['called_pct']:+.1f}%" + f'<div style="color:{MUTED};font-size:11px">{r["called_annual_pct"]:+.0f}% annual</div>',
+                            tags])
+            return _mini_table([("Expiry", "left"), ("Strike", "right"), ("Bid / Ask", "right"), ("Delta", "right"),
+                                (f"Premium x{it['avail']}", "right"), ("Annual", "right"), ("If called", "right"),
+                                ("Flags", "left")], out)
+
+        if c["good"]:
+            body += table(c["good"]).replace("margin:16px 0 6px", "margin:0 0 6px")
+            if c["good_total"] > len(c["good"]):
+                body += f'<div style="margin-top:4px;font-size:11.5px;color:{MUTED}">{c["good_total"] - len(c["good"])} more passed; top {len(c["good"])} shown.</div>'
+            if c["loss_total"]:
+                body += (f'<div style="margin-top:4px;font-size:11.5px;color:{MUTED}">{c["loss_total"]} more strike(s) would lock in a loss '
+                         "(strike + premium below your net cost) and are hidden.</div>")
+        else:
+            body += (f'<div style="font-size:12px;color:#a12626;margin-bottom:6px">Every call that passed the filters has a strike '
+                     "below your net cost. Selling one means accepting a loss if the shares are called away. Shown for reference:</div>"
+                     + table(c["loss"]))
+    return _card("Covered call candidates", body,
+                 f"For shares in positions.yaml with a free 100-share block. DTE {cc['dte_min']}-{cc['dte_max']}, delta "
+                 f"{cc['delta_min']:.2f}-{cc['delta_max']:.2f}, OI ≥ {cc['min_oi']:.0f}, bid ≥ {cc['min_bid']:.2f}, spread < "
+                 f"{cc['max_spread_pct']:.0f}%. Annual = premium / net cost × 365 / DTE. If called = return if the shares are "
+                 "sold at the strike, premium included. Candidates only; not advice.")
+
+
 def _near_table(shown: list[dict]) -> str:
     esc = html.escape
     widths = (11, 12, 11, 9, 9, 9, 10, 29)   # column widths (%), same in all near-miss tables
@@ -1608,7 +1741,7 @@ def build_html(result: ScanResult, cfg: dict, today: dt.date) -> str:
                       f'font-size:13px;color:{INK}"><b>No candidate passed all filters today.</b> '
                       f'The near misses and filter summary below show why.</div>')
 
-    cards = _wheel_card(result, cfg, today) + _changes_card(result, cfg, today) + cards + _budget_card(result, cfg)
+    cards = _wheel_card(result, cfg, today) + _cc_card(result, cfg) + _changes_card(result, cfg, today) + cards + _budget_card(result, cfg)
 
     # ---- near misses
     groups = group_near_misses(result, cfg)
