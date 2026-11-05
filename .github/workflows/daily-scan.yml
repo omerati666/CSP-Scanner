@@ -69,7 +69,7 @@ jobs:
         run: |
           git config user.name "csp-scanner-bot"
           git config user.email "csp-scanner-bot@users.noreply.github.com"
-          git add data/iv_history.csv
+          git add data/
           if git diff --cached --quiet; then
             echo "IV geçmişinde değişiklik yok."
           else
