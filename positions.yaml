@@ -39,6 +39,7 @@ shares:
   - {symbol: ORCL, shares: 100, cost: 170.00, premium_collected: 7.65}
   - {symbol: RKLB, shares: 100, cost: 100.00, premium_collected: 8.46}
   - {symbol: SOXL, shares: 100, cost: 132.00, premium_collected: 8.50}
+  - {symbol: SPCX, shares: 100, cost: 160.00, premium_collected: 4.35}
 
 calls:
   # - {symbol: INTC, expiry: 2026-12-18, strike: 60, contracts: 1, premium: 1.10}
