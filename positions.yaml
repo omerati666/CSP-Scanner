@@ -30,7 +30,8 @@
 
 puts:
   - {symbol: CRM, expiry: 2026-11-20, strike: 220, contracts: 1, premium: 3.60}
-  # - {symbol: ONTO, expiry: 2026-11-20, strike: 200, contracts: 1, premium: 9.00, note: "Nov cycle"}
+  - {symbol: GLD, expiry: 2026-12-11, strike: 370, contracts: 1, premium: 10.00, note: "Nov cycle"}
+  - {symbol: MRVL, expiry: 2026-12-11, strike: 130, contracts: 1, premium: 10.00}
 
 shares:
   - {symbol: FSLR, shares: 100, cost: 240.00, premium_collected: 13.50}
